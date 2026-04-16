@@ -703,6 +703,9 @@ class EngineArgs:
         MambaConfig.enable_stochastic_rounding
     )
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
+    vocabulary_cache_directory_path: str | None = (
+        CacheConfig.vocabulary_cache_directory_path
+    )
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -1209,6 +1212,11 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--vocabulary-cache-directory-path",
+            **cache_kwargs["vocabulary_cache_directory_path"],
+        )
+
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1921,6 +1929,7 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            vocabulary_cache_directory_path=self.vocabulary_cache_directory_path,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):

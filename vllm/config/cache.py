@@ -188,6 +188,12 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    vocabulary_cache_directory_path: str | None = None
+    """Path for serializing the backend to disk. This will make
+    subsequent constructions of the `DotJsonBackend` significantly faster
+    as it will deserialize from disk rather than repeating an expensive
+    computation. Setting it to None disables caching."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

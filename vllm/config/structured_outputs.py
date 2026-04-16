@@ -10,7 +10,7 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
 StructuredOutputsBackend = Literal[
-    "auto", "xgrammar", "guidance", "outlines", "lm-format-enforcer"
+    "auto", "xgrammar", "guidance", "outlines", "lm-format-enforcer", "dotjson"
 ]
 
 
@@ -61,14 +61,21 @@ class StructuredOutputsConfig:
 
     @model_validator(mode="after")
     def _validate_structured_output_config(self) -> Self:
-        if self.disable_any_whitespace and self.backend not in ("xgrammar", "guidance"):
+        if self.disable_any_whitespace and self.backend not in (
+            "dotjson",
+            "xgrammar",
+            "guidance",
+        ):
             raise ValueError(
                 "disable_any_whitespace is only supported for "
-                "xgrammar and guidance backends."
+                "dotjson, xgrammar and guidance backends."
             )
-        if self.disable_additional_properties and self.backend != "guidance":
+        if self.disable_additional_properties and self.backend not in (
+            "dotjson",
+            "guidance",
+        ):
             raise ValueError(
                 "disable_additional_properties is only supported "
-                "for the guidance backend."
+                "for dotjson and guidance backends."
             )
         return self

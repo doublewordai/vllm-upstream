@@ -987,6 +987,7 @@ class SamplingParams(
             validate_structured_output_request_outlines,
         )
         from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+        from vllm.v1.structured_output.backend_dotjson import validate_dotjson_grammar
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
@@ -1019,6 +1020,8 @@ class SamplingParams(
                     "backends or tokenizer_mode='hf' instead."
                 )
             validate_structured_output_request_lm_format_enforcer(self)
+        elif backend == "dotjson":
+            validate_dotjson_grammar(self)
         else:
             # NOTE: backend must be "auto" here, because we have
             # checked supported_backends above.

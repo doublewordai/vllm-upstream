@@ -161,6 +161,14 @@ class StructuredOutputManager:
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
                 )
+            elif backend == "dotjson":
+                from vllm.v1.structured_output.backend_dotjson import DotJsonBackend
+
+                self.backend = DotJsonBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
 
