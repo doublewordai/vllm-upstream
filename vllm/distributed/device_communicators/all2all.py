@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +16,8 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
-from vllm.utils.import_utils import has_deep_ep, has_mori
+from vllm.utils.import_utils import has_deep_ep, has_mori, has_pplx_garden
+from vllm.utils.math_utils import cdiv, round_up
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -499,6 +501,323 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer.set_tcp_store_group(None)
 
     # NIXL EP uses RDMA so no SMs are used for communication
+    def max_sms_used(self) -> int | None:
+        return 0
+
+
+class _PplxGardenParallelGroup:
+    def __init__(
+        self,
+        *,
+        cpu_group: dist.ProcessGroup,
+        device: torch.device,
+        ranks: list[int],
+        owns_group: bool = False,
+    ) -> None:
+        self._cpu_group = cpu_group
+        self._device = device
+        self._ranks = ranks
+        self._owns_group = owns_group
+        self._global_rank = dist.get_rank()
+        self._rank = ranks.index(self._global_rank)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def rank(self) -> int:
+        return self._rank
+
+    @property
+    def global_rank(self) -> int:
+        return self._global_rank
+
+    @property
+    def node_rank(self) -> int:
+        local_world_size = max(torch.cuda.device_count(), 1)
+        return self._global_rank // local_world_size
+
+    @property
+    def local_rank(self) -> int:
+        return self._device.index or 0
+
+    @property
+    def size(self) -> int:
+        return len(self._ranks)
+
+    @property
+    def is_inter_node(self) -> bool:
+        return self.size > max(torch.cuda.device_count(), 1)
+
+    def all_gather_object(self, obj):
+        object_list = [None] * self.size
+        dist.all_gather_object(object_list, obj, group=self._cpu_group)
+        return object_list
+
+    def barrier(self) -> None:
+        dist.barrier(group=self._cpu_group)
+
+    def slice_by_count(self, slice_count: int) -> "_PplxGardenParallelGroup":
+        assert self.size % slice_count == 0
+        slice_size = self.size // slice_count
+        selected_group = None
+        selected_ranks = None
+        for start in range(0, self.size, slice_size):
+            ranks = self._ranks[start : start + slice_size]
+            group = dist.new_group(ranks, backend="gloo")
+            if self._global_rank in ranks:
+                selected_group = group
+                selected_ranks = ranks
+        assert selected_group is not None
+        assert selected_ranks is not None
+        return _PplxGardenParallelGroup(
+            cpu_group=selected_group,
+            device=self._device,
+            ranks=selected_ranks,
+            owns_group=True,
+        )
+
+    def slice_by_lens(self, slice_lens: list[int]) -> "_PplxGardenParallelGroup":
+        assert sum(slice_lens) == self.size
+        selected_group = None
+        selected_ranks = None
+        start = 0
+        for length in slice_lens:
+            ranks = self._ranks[start : start + length]
+            group = dist.new_group(ranks, backend="gloo")
+            if self._global_rank in ranks:
+                selected_group = group
+                selected_ranks = ranks
+            start += length
+        assert selected_group is not None
+        assert selected_ranks is not None
+        return _PplxGardenParallelGroup(
+            cpu_group=selected_group,
+            device=self._device,
+            ranks=selected_ranks,
+            owns_group=True,
+        )
+
+    def destroy(self) -> None:
+        if self._owns_group:
+            dist.destroy_process_group(self._cpu_group)
+            self._owns_group = False
+
+
+class PplxGardenAll2AllHandle:
+    def __init__(
+        self,
+        *,
+        kernel=None,
+        kernels=None,
+        max_recv_tokens: int = 0,
+        num_local_experts: int,
+        rank_expert_offset: int,
+        global_group: _PplxGardenParallelGroup,
+        node_group: _PplxGardenParallelGroup | None,
+    ) -> None:
+        if kernels is None:
+            assert kernel is not None
+            kernels = [kernel]
+        assert kernels
+        self.kernels = list(kernels)
+        self.kernel = self.kernels[0]
+        self._slot_cond = threading.Condition()
+        self._available_slots = list(range(len(self.kernels)))
+        self.max_recv_tokens = max_recv_tokens
+        self.num_local_experts = num_local_experts
+        self.rank_expert_offset = rank_expert_offset
+        self.global_group = global_group
+        self.node_group = node_group
+
+    def acquire_kernel_slot(self) -> tuple[int, Any]:
+        with self._slot_cond:
+            while not self._available_slots:
+                self._slot_cond.wait()
+            slot = self._available_slots.pop(0)
+        return slot, self.kernels[slot]
+
+    def release_kernel_slot(self, slot: int) -> None:
+        with self._slot_cond:
+            if slot not in self._available_slots:
+                self._available_slots.append(slot)
+                self._slot_cond.notify()
+
+    def kernel_for_ubatch(self, ubatch_id: int):
+        return self.kernels[ubatch_id % len(self.kernels)]
+
+    def destroy(self) -> None:
+        for kernel in self.kernels:
+            kernel.destroy()
+        if self.node_group is not None:
+            self.node_group.destroy()
+
+
+class PplxGardenAll2AllManager(All2AllManagerBase):
+    def __init__(self, cpu_group, tcp_store_group=None):
+        assert has_pplx_garden(), (
+            "PPLX Garden kernels not found. Install pplx_garden and select "
+            "--all2all-backend=pplx_garden only on supported CXI/RDMA hosts."
+        )
+        super().__init__(cpu_group, tcp_store_group)
+        self.handle_cache = Cache()
+
+    def _make_all2all_kwargs(
+        self,
+        max_num_tokens_per_dp_rank: int,
+        token_hidden_size: int,
+        input_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        num_ep_ranks: int,
+        num_global_experts: int,
+        num_local_experts: int,
+        num_experts_per_token: int,
+    ) -> dict[str, Any]:
+        max_private_tokens = int(os.environ.get("VLLM_PPLX_GARDEN_MAX_PRIVATE_TOKENS", "0"))
+        if max_private_tokens <= 0:
+            max_private_tokens = None
+
+        nets_per_gpu = int(os.environ.get("VLLM_PPLX_GARDEN_NETS_PER_GPU", "1"))
+        local_size = max(torch.cuda.device_count(), 1)
+        nvlink_group_size = min(local_size, num_ep_ranks)
+        if os.environ.get("VLLM_PPLX_GARDEN_DISABLE_NVLINK", "0").lower() in ("1", "true", "yes"):
+            nvlink_group_size = 1
+
+        if self.tp_group.world_size != 1:
+            raise NotImplementedError(
+                "pplx_garden all2all currently supports expert parallelism with "
+                "tensor_parallel_size=1 only."
+            )
+
+        num_dp_groups = num_ep_ranks
+        avg_tokens_per_expert = int(
+            cdiv(
+                max_num_tokens_per_dp_rank * num_experts_per_token,
+                num_global_experts,
+            )
+            * 1.2
+        )
+        private_tokens = (
+            avg_tokens_per_expert * num_local_experts
+            if max_private_tokens is None
+            else max_private_tokens
+        )
+        num_tokens = max_num_tokens_per_dp_rank * num_dp_groups
+        max_recv_tokens = private_tokens * num_dp_groups + round_up(
+            max(
+                min(
+                    num_tokens * num_experts_per_token,
+                    num_tokens * num_local_experts,
+                ),
+                num_local_experts,
+            ),
+            1,
+        )
+
+        a2a_slots = 2 if os.environ.get("VLLM_PPLX_ENABLE_DBO", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ) else 1
+
+        return dict(
+            max_num_tokens=max_num_tokens_per_dp_rank,
+            num_experts=num_global_experts,
+            expert_padding=1,
+            hidden_dim=token_hidden_size,
+            hidden_dim_scale=None,
+            max_private_tokens=max_private_tokens,
+            in_dtype=input_dtype,
+            out_dtype=output_dtype,
+            scale_dtype=None,
+            num_experts_per_token=num_experts_per_token,
+            nets_per_gpu=nets_per_gpu,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            nvlink_group_size=nvlink_group_size,
+            max_recv_tokens=max_recv_tokens,
+            num_local_experts=num_local_experts,
+            a2a_slots=a2a_slots,
+        )
+
+    def get_handle(self, kwargs):
+        from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
+
+        buffer_kwargs = self._make_all2all_kwargs(**kwargs)
+        logger.debug("PPLX Garden all2all args %s", buffer_kwargs)
+
+        def make_handle(**handle_kwargs):
+            from pplx_garden.fabric_lib import TransferEngine
+
+            ranks = dist.get_process_group_ranks(self.cpu_group)
+            global_group = _PplxGardenParallelGroup(
+                cpu_group=self.cpu_group,
+                device=handle_kwargs.pop("device"),
+                ranks=ranks,
+            )
+            nvlink_group_size = handle_kwargs.pop("nvlink_group_size")
+            node_group = None
+            if nvlink_group_size > 1:
+                node_group = global_group.slice_by_count(
+                    global_group.size // nvlink_group_size
+                )
+            max_recv_tokens = handle_kwargs.pop("max_recv_tokens")
+            num_local_experts = handle_kwargs.pop("num_local_experts")
+            a2a_slots = handle_kwargs.pop("a2a_slots")
+            shared_transfer_engine = None
+            topo_group = None
+            if a2a_slots > 1:
+                system_topo = TransferEngine.detect_topology()
+                device_index = global_group.device.index
+                groups = [group for group in system_topo if group.cuda_device == device_index]
+                if len(groups) == 1:
+                    group = groups[0]
+                elif device_index is not None and 0 <= device_index < len(system_topo):
+                    group = system_topo[device_index]
+                else:
+                    raise RuntimeError(f"Cannot identify topology group for cuda:{device_index}")
+                topo_group = group
+                if len(group.cpus) < 2:
+                    raise RuntimeError(f"Not enough CPUs in device group for cuda:{device_index}")
+                domain_cpu, uvm_cpu, *_ = group.cpus
+                nets_per_gpu = handle_kwargs["nets_per_gpu"]
+                domains = group.domains[:nets_per_gpu]
+                builder = TransferEngine.builder()
+                builder.add_gpu_domains(group.cuda_device, domains, domain_cpu, uvm_cpu)
+                shared_transfer_engine = builder.build()
+            kernels = []
+            for slot in range(a2a_slots):
+                worker_cpu = None
+                if topo_group is not None:
+                    cpu_index = min(slot + 3, max(0, len(topo_group.cpus) - 1))
+                    worker_cpu = topo_group.cpus[cpu_index]
+                kernels.append(P2PAllToAll(
+                    **handle_kwargs,
+                    device=global_group.device,
+                    dp_group=None,
+                    node_group=node_group,
+                    global_group=global_group,
+                    imm_base=0x80000000 + slot * 0x100,
+                    transfer_engine=shared_transfer_engine,
+                    worker_cpu=worker_cpu,
+                ))
+            return PplxGardenAll2AllHandle(
+                kernels=kernels,
+                max_recv_tokens=max_recv_tokens,
+                num_local_experts=num_local_experts,
+                rank_expert_offset=self.rank * num_local_experts,
+                global_group=global_group,
+                node_group=node_group,
+            )
+
+        return self.handle_cache.get_or_create(buffer_kwargs, make_handle)
+
+    def destroy(self):
+        with self.handle_cache._lock:
+            for _, handle in self.handle_cache._cache.items():
+                handle.destroy()
+            self.handle_cache._cache.clear()
+
     def max_sms_used(self) -> int | None:
         return 0
 

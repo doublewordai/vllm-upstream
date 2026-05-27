@@ -40,6 +40,7 @@ EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
 All2AllBackend = Literal[
     "naive",
     "pplx",
+    "pplx_garden",
     "deepep_high_throughput",
     "deepep_low_latency",
     "mori",
@@ -178,6 +179,7 @@ class ParallelConfig:
     - "deepep_high_throughput": Use deepep high-throughput kernels
     - "deepep_low_latency": Use deepep low-latency kernels
     - "mori": Use mori kernels
+    - "pplx_garden": Use PPLX Garden CXI/RDMA kernels
     - "nixl_ep": Use nixl-ep kernels
     - "flashinfer_nvlink_two_sided": Use flashinfer two-sided kernels for mnnvl
     - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels"""

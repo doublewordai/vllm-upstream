@@ -294,17 +294,22 @@ class UBatchWrapper:
 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
-        def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
-            results.append((ubatch_metadata.context.id, model_output))
+        def _ubatch_thread(results, errors, model, ubatch_metadata):
+            try:
+                with ubatch_metadata.context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
+                results.append((ubatch_metadata.context.id, model_output))
+            except BaseException as exc:
+                logger.exception("DBO ubatch thread failed")
+                errors.append(exc)
 
         results: list[tuple[int, torch.Tensor]] = []
+        errors: list[BaseException] = []
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
@@ -316,6 +321,7 @@ class UBatchWrapper:
                     target=_ubatch_thread,
                     args=(
                         results,
+                        errors,
                         model,
                         metadata,
                     ),
@@ -326,7 +332,14 @@ class UBatchWrapper:
             ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
                 thread.join()
+        if errors:
+            raise RuntimeError("DBO ubatch thread failed") from errors[0]
         sorted_results = [value for position, value in sorted(results)]
+        if len(sorted_results) != len(ubatch_metadata):
+            raise RuntimeError(
+                f"DBO ubatch result count mismatch: got {len(sorted_results)}, "
+                f"expected {len(ubatch_metadata)}"
+            )
         result = _cat_ubatch_outputs(sorted_results)
         return result
 

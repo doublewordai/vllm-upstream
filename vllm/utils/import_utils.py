@@ -420,6 +420,11 @@ def has_nixl_ep() -> bool:
     return _has_module("nixl_ep")
 
 
+def has_pplx_garden() -> bool:
+    """Whether the optional `pplx_garden` package is available."""
+    return _has_module("pplx_garden")
+
+
 def has_triton_kernels() -> bool:
     """Whether the optional `triton_kernels` package is available."""
     is_available = _has_module("triton_kernels") or _has_module(

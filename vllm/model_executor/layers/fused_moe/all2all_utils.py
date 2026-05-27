@@ -232,6 +232,29 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=use_fp8_dispatch,
         )
 
+    elif moe.use_pplx_garden_kernels:
+        from .prepare_finalize.pplx_garden import PplxGardenPrepareAndFinalize
+
+        assert quant_config is not None
+        all_to_all_args = dict(
+            max_num_tokens_per_dp_rank=moe.max_num_tokens,
+            token_hidden_size=moe.hidden_dim,
+            input_dtype=moe.in_dtype,
+            output_dtype=moe.in_dtype,
+            num_ep_ranks=all2all_manager.world_size,
+            num_global_experts=moe.num_experts,
+            num_local_experts=moe.num_experts // all2all_manager.world_size,
+            num_experts_per_token=moe.experts_per_token,
+        )
+        handle = all2all_manager.get_handle(all_to_all_args)
+        prepare_finalize = PplxGardenPrepareAndFinalize(
+            handle,
+            max_tokens_per_rank=moe.max_num_tokens,
+            num_dispatchers=all2all_manager.world_size,
+            num_local_experts=moe.num_experts // all2all_manager.world_size,
+            rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
+        )
+
     elif moe.use_fi_nvl_two_sided_kernels:
         assert quant_config is not None
         prepare_finalize = FlashInferNVLinkTwoSidedPrepareAndFinalize(

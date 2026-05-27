@@ -73,6 +73,8 @@ def maybe_create_ubatch_slices(
 
     if split_point is None:
         split_point = int(num_tokens_padded) // num_ubatches
+        if split_point <= 0:
+            return None, None
 
     token_split_points = [split_point * i for i in range(1, num_ubatches)]
 
@@ -105,9 +107,15 @@ def maybe_create_ubatch_slices(
 
         start_token = end_token
 
+    if any(ubatch_slice.is_empty() for ubatch_slice in ubatch_slices):
+        return None, None
+
     ubatch_slices_padded = _pad_out_ubatch_slices(
         ubatch_slices, num_tokens_padded, num_reqs_padded
     )
+
+    if any(ubatch_slice.is_empty() for ubatch_slice in ubatch_slices_padded):
+        return None, None
 
     assert sum(s.num_tokens for s in ubatch_slices_padded) == num_tokens_padded
 
@@ -231,6 +239,11 @@ def _make_metadata_with_slice(
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
+    positions = (
+        attn_metadata.positions[token_slice]
+        if attn_metadata.positions is not None
+        else None
+    )
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
@@ -242,6 +255,7 @@ def _make_metadata_with_slice(
         max_seq_len=max_seq_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        positions=positions,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
