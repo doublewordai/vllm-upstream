@@ -631,27 +631,92 @@ class PplxGardenAll2AllHandle:
         self.global_group = global_group
         self.node_group = node_group
 
-    def acquire_kernel_slot(self) -> tuple[int, Any]:
+    def _acquire_kernel_slot(self) -> tuple[int, Any]:
         with self._slot_cond:
             while not self._available_slots:
                 self._slot_cond.wait()
             slot = self._available_slots.pop(0)
         return slot, self.kernels[slot]
 
-    def release_kernel_slot(self, slot: int) -> None:
+    def _release_kernel_slot(self, slot: int) -> None:
         with self._slot_cond:
             if slot not in self._available_slots:
                 self._available_slots.append(slot)
                 self._slot_cond.notify()
 
-    def kernel_for_ubatch(self, ubatch_id: int):
-        return self.kernels[ubatch_id % len(self.kernels)]
+    def dispatch_async(self, **kwargs):
+        slot, kernel = self._acquire_kernel_slot()
+        try:
+            dispatch_handle = kernel.dispatch_async(**kwargs)
+        except Exception:
+            self._release_kernel_slot(slot)
+            raise
+        return _PplxGardenDispatchHandle(self, slot, kernel, dispatch_handle)
+
+    def combine_async(self, *, dispatch_handle, **kwargs):
+        return dispatch_handle.combine_async(**kwargs)
 
     def destroy(self) -> None:
         for kernel in self.kernels:
             kernel.destroy()
         if self.node_group is not None:
             self.node_group.destroy()
+
+
+class _PplxGardenDispatchHandle:
+    def __init__(
+        self,
+        owner: PplxGardenAll2AllHandle,
+        slot: int,
+        kernel,
+        backend_handle,
+    ) -> None:
+        self._owner = owner
+        self._slot = slot
+        self._kernel = kernel
+        self.backend_handle = backend_handle
+        self._released = False
+
+    @property
+    def indices(self):
+        return self.backend_handle.indices
+
+    @property
+    def weights(self):
+        return self.backend_handle.weights
+
+    def recv(self) -> None:
+        self.backend_handle.recv()
+
+    def combine_async(self, **kwargs):
+        try:
+            return _PplxGardenCombineHandle(
+                self,
+                self._kernel.combine_async(
+                    dispatch_handle=self.backend_handle,
+                    **kwargs,
+                ),
+            )
+        except Exception:
+            self.release()
+            raise
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._owner._release_kernel_slot(self._slot)
+
+
+class _PplxGardenCombineHandle:
+    def __init__(self, dispatch_handle: _PplxGardenDispatchHandle, backend_handle):
+        self._dispatch_handle = dispatch_handle
+        self.backend_handle = backend_handle
+
+    def recv(self) -> None:
+        try:
+            self.backend_handle.recv()
+        finally:
+            self._dispatch_handle.release()
 
 
 class PplxGardenAll2AllManager(All2AllManagerBase):

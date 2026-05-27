@@ -19,8 +19,6 @@ _GPU_ROUTE_THRESHOLD = 1_000_000
 
 
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    _next_kernel_slot: int = 0
-
     """
     Prepare/Finalize using PPLX Garden's CXI/RDMA P2P all-to-all.
 
@@ -42,9 +40,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.num_local_experts = num_local_experts
         self.rank_expert_offset = rank_expert_offset
-        self._original_topk_ids: dict[int, torch.Tensor] = {}
-        self._original_topk_weights: dict[int, torch.Tensor] = {}
-        self._kernel_slots: dict[int, int] = {}
+        self._dispatch_handles: dict[int, object] = {}
         self._async_enabled = os.environ.get("VLLM_PPLX_ENABLE_DBO", "0").lower() in (
             "1",
             "true",
@@ -66,31 +62,6 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def output_is_reduced(self) -> bool:
         return True
-
-    def _claim_kernel_for_ubatch(self, ubatch_id: int):
-        if hasattr(self.handle, "acquire_kernel_slot"):
-            slot, kernel = self.handle.acquire_kernel_slot()
-            self._kernel_slots[ubatch_id] = slot
-            return kernel
-        if hasattr(self.handle, "kernels"):
-            slot = PplxGardenPrepareAndFinalize._next_kernel_slot % len(self.handle.kernels)
-            PplxGardenPrepareAndFinalize._next_kernel_slot += 1
-            self._kernel_slots[ubatch_id] = slot
-            return self.handle.kernels[slot]
-        return self.handle.kernel
-
-    def _kernel_for_ubatch(self, ubatch_id: int):
-        slot = self._kernel_slots.get(ubatch_id)
-        if slot is not None and hasattr(self.handle, "kernels"):
-            return self.handle.kernels[slot]
-        if hasattr(self.handle, "kernel_for_ubatch"):
-            return self.handle.kernel_for_ubatch(ubatch_id)
-        return self.handle.kernel
-
-    def _release_kernel_for_ubatch(self, ubatch_id: int) -> None:
-        slot = self._kernel_slots.pop(ubatch_id, None)
-        if slot is not None and hasattr(self.handle, "release_kernel_slot"):
-            self.handle.release_kernel_slot(slot)
 
     def supports_async(self) -> bool:
         return self._async_enabled
@@ -148,15 +119,12 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             a1 = a1 * topk_weights.to(a1.dtype)
 
         ubatch_id = dbo_current_ubatch_id()
-        kernel = self._claim_kernel_for_ubatch(ubatch_id)
         original_topk_ids = topk_ids.to(torch.uint32).contiguous()
         original_topk_weights = (
             torch.ones_like(topk_weights)
             if apply_router_weight_on_input
             else topk_weights
         ).to(torch.float32).contiguous()
-        self._original_topk_ids[ubatch_id] = original_topk_ids
-        self._original_topk_weights[ubatch_id] = original_topk_weights
 
         expert_num_tokens = torch.empty(
             (self.num_local_experts,), dtype=torch.int32, device=a1.device
@@ -165,7 +133,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             (self.handle.max_recv_tokens, a1.shape[1]), dtype=a1.dtype, device=a1.device
         )
         dp_x = a1.contiguous()
-        kernel.dispatch(
+        dispatch_handle = self.handle.dispatch_async(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
             out_expert_x_scale=None,
@@ -173,31 +141,11 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dp_x_scale=None,
             indices=original_topk_ids,
             weights=original_topk_weights,
-            do_send=True,
-            do_recv=False,
         )
-        send_done_event = torch.cuda.Event()
-        send_done_event.record(torch.cuda.current_stream(a1.device))
-
-        recv_done = False
+        self._dispatch_handles[ubatch_id] = dispatch_handle
 
         def hook() -> None:
-            nonlocal recv_done
-            if recv_done:
-                return
-            torch.cuda.current_stream(a1.device).wait_event(send_done_event)
-            kernel.dispatch(
-                out_expert_num_tokens=expert_num_tokens,
-                out_expert_x=expert_x,
-                out_expert_x_scale=None,
-                dp_x=dp_x,
-                dp_x_scale=None,
-                indices=original_topk_ids,
-                weights=original_topk_weights,
-                do_send=False,
-                do_recv=True,
-            )
-            recv_done = True
+            dispatch_handle.recv()
 
         def receiver() -> mk.PrepareResultType:
             hook()
@@ -288,11 +236,8 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> tuple[Callable[[], None] | None, Callable[[], None]] | Callable[[], None]:
         del apply_router_weight_on_input, topk_weights, topk_ids, weight_and_reduce_impl
         ubatch_id = dbo_current_ubatch_id()
-        kernel = self._kernel_for_ubatch(ubatch_id)
-        assert ubatch_id in self._original_topk_ids
-        assert ubatch_id in self._original_topk_weights
-        original_topk_ids = self._original_topk_ids[ubatch_id]
-        original_topk_weights = self._original_topk_weights[ubatch_id]
+        assert ubatch_id in self._dispatch_handles
+        dispatch_handle = self._dispatch_handles[ubatch_id]
 
         if fused_expert_output.ndim == 3:
             assert fused_expert_output.shape[1] == 1
@@ -301,35 +246,14 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_y = fused_expert_output
 
         expert_y_send = expert_y.contiguous()
-        kernel.combine(
+        combine_handle = self.handle.combine_async(
             out_tokens=output,
-            indices=original_topk_ids,
-            weights=original_topk_weights,
+            dispatch_handle=dispatch_handle,
             expert_y=expert_y_send,
-            do_send=True,
-            do_recv=False,
         )
-        send_done_event = torch.cuda.Event()
-        send_done_event.record(torch.cuda.current_stream(output.device))
-
-        recv_done = False
 
         def hook() -> None:
-            nonlocal recv_done
-            if recv_done:
-                return
-            torch.cuda.current_stream(output.device).wait_event(send_done_event)
-            kernel.combine(
-                out_tokens=output,
-                indices=original_topk_ids,
-                weights=original_topk_weights,
-                expert_y=expert_y_send,
-                do_send=False,
-                do_recv=True,
-            )
-            recv_done = True
-            self._original_topk_ids.pop(ubatch_id, None)
-            self._original_topk_weights.pop(ubatch_id, None)
-            self._release_kernel_for_ubatch(ubatch_id)
+            combine_handle.recv()
+            self._dispatch_handles.pop(ubatch_id, None)
 
         return hook, lambda: None
