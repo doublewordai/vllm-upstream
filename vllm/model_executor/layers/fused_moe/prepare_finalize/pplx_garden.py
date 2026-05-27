@@ -15,7 +15,6 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = logging.getLogger(__name__)
-_GPU_ROUTE_THRESHOLD = 1_000_000
 
 
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -49,13 +48,13 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
-        return mk.FusedMoEActivationFormat.Standard
+        return mk.FusedMoEActivationFormat.BatchedExperts
 
     def max_num_tokens_per_rank(self) -> int | None:
         return self.max_tokens_per_rank
 
     def topk_indices_dtype(self) -> torch.dtype | None:
-        return None
+        return torch.int64
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -130,7 +129,13 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             (self.num_local_experts,), dtype=torch.int32, device=a1.device
         )
         expert_x = torch.empty(
-            (self.handle.max_recv_tokens, a1.shape[1]), dtype=a1.dtype, device=a1.device
+            (
+                self.num_local_experts,
+                self.handle.max_tokens_per_expert,
+                a1.shape[1],
+            ),
+            dtype=a1.dtype,
+            device=a1.device,
         )
         dp_x = a1.contiguous()
         dispatch_handle = self.handle.dispatch_async(
@@ -149,56 +154,18 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         def receiver() -> mk.PrepareResultType:
             hook()
-            active_rows = int(expert_num_tokens.sum().item())
-            active_expert_x = expert_x[:active_rows]
-            fake_topk_ids, fake_topk_weights = self._make_local_expert_routing(
-                expert_num_tokens, active_rows, topk_ids.dtype
-            )
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
             )
             return (
-                active_expert_x,
+                expert_x,
                 None,
                 expert_tokens_meta,
-                fake_topk_ids,
-                fake_topk_weights,
+                None,
+                None,
             )
 
         return hook, receiver
-
-    def _make_local_expert_routing(
-        self, expert_num_tokens: torch.Tensor, rows: int, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if dtype not in (torch.int32, torch.int64):
-            dtype = torch.int64
-        fake_topk_ids = torch.full(
-            (rows, 1),
-            self.rank_expert_offset,
-            dtype=dtype,
-            device=expert_num_tokens.device,
-        )
-        fake_topk_weights = torch.zeros(
-            (rows, 1), dtype=torch.float32, device=expert_num_tokens.device
-        )
-
-        if rows > _GPU_ROUTE_THRESHOLD:
-            offset = 0
-            for expert, count in enumerate(expert_num_tokens.detach().cpu().tolist()):
-                end = offset + int(count)
-                if end > offset:
-                    fake_topk_ids[offset:end, 0] = self.rank_expert_offset + expert
-                    fake_topk_weights[offset:end, 0] = 1
-                offset = end
-            return fake_topk_ids, fake_topk_weights
-
-        row_ids = torch.arange(rows, dtype=torch.int64, device=expert_num_tokens.device)
-        expert_offsets = torch.cumsum(expert_num_tokens.to(torch.int64), dim=0)
-        valid_rows = row_ids < expert_offsets[-1]
-        local_experts = torch.searchsorted(expert_offsets, row_ids + 1)
-        fake_topk_ids[:, 0] = (local_experts + self.rank_expert_offset).to(dtype)
-        fake_topk_weights[:, 0] = valid_rows.to(torch.float32)
-        return fake_topk_ids, fake_topk_weights
 
     def finalize(
         self,
@@ -240,12 +207,10 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dispatch_handle = self._dispatch_handles[ubatch_id]
 
         if fused_expert_output.ndim == 3:
-            assert fused_expert_output.shape[1] == 1
-            expert_y = fused_expert_output[:, 0, :]
-        else:
-            expert_y = fused_expert_output
+            assert fused_expert_output.shape[0] == self.num_local_experts
+            assert fused_expert_output.shape[1] == self.handle.max_tokens_per_expert
 
-        expert_y_send = expert_y.contiguous()
+        expert_y_send = fused_expert_output.contiguous()
         combine_handle = self.handle.combine_async(
             out_tokens=output,
             dispatch_handle=dispatch_handle,

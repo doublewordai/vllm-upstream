@@ -616,6 +616,7 @@ class PplxGardenAll2AllHandle:
         rank_expert_offset: int,
         global_group: _PplxGardenParallelGroup,
         node_group: _PplxGardenParallelGroup | None,
+        max_tokens_per_expert: int,
     ) -> None:
         if kernels is None:
             assert kernel is not None
@@ -626,6 +627,7 @@ class PplxGardenAll2AllHandle:
         self._slot_cond = threading.Condition()
         self._available_slots = list(range(len(self.kernels)))
         self.max_recv_tokens = max_recv_tokens
+        self.max_tokens_per_expert = max_tokens_per_expert
         self.num_local_experts = num_local_experts
         self.rank_expert_offset = rank_expert_offset
         self.global_group = global_group
@@ -801,6 +803,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             nvlink_group_size=nvlink_group_size,
             max_recv_tokens=max_recv_tokens,
+            max_tokens_per_expert=max_num_tokens_per_dp_rank * num_ep_ranks,
             num_local_experts=num_local_experts,
             a2a_slots=a2a_slots,
         )
@@ -827,6 +830,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                     global_group.size // nvlink_group_size
                 )
             max_recv_tokens = handle_kwargs.pop("max_recv_tokens")
+            max_tokens_per_expert = handle_kwargs.pop("max_tokens_per_expert")
             num_local_experts = handle_kwargs.pop("num_local_experts")
             a2a_slots = handle_kwargs.pop("a2a_slots")
             shared_transfer_engine = None
@@ -865,10 +869,12 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                     imm_base=0x80000000 + slot * 0x100,
                     transfer_engine=shared_transfer_engine,
                     worker_cpu=worker_cpu,
+                    max_tokens_per_expert=max_tokens_per_expert,
                 ))
             return PplxGardenAll2AllHandle(
                 kernels=kernels,
                 max_recv_tokens=max_recv_tokens,
+                max_tokens_per_expert=max_tokens_per_expert,
                 num_local_experts=num_local_experts,
                 rank_expert_offset=self.rank * num_local_experts,
                 global_group=global_group,
