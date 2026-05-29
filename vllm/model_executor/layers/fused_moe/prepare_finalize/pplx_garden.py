@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
-import os
 from collections.abc import Callable
 
 import torch
@@ -13,8 +11,6 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -40,11 +36,6 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_local_experts = num_local_experts
         self.rank_expert_offset = rank_expert_offset
         self._dispatch_handles: dict[int, object] = {}
-        self._async_enabled = os.environ.get("VLLM_PPLX_ENABLE_DBO", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -63,7 +54,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         return True
 
     def supports_async(self) -> bool:
-        return self._async_enabled
+        return True
 
     def prepare(
         self,

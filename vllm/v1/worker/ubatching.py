@@ -122,9 +122,8 @@ class UBatchContext:
 
     def maybe_run_recv_hook(self):
         if self.recv_hook is not None:
-            recv_hook = self.recv_hook
+            self.recv_hook()
             self.recv_hook = None
-            recv_hook()
 
     def yield_(self):
         self.current_stream = current_stream()
@@ -188,16 +187,6 @@ def dbo_register_recv_hook(recv_hook):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % _NUM_UBATCHES]
-        if next_ctx is None:
-            recv_hook()
-            return
-        if next_ctx.recv_hook is not None:
-            msg = (
-                f"DBO recv hook overwrite: current_ubatch={ctx_idx} "
-                f"target_ubatch={(ctx_idx + 1) % _NUM_UBATCHES}"
-            )
-            logger.error(msg)
-            raise RuntimeError(msg)
         next_ctx.recv_hook = recv_hook
 
 
