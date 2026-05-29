@@ -609,8 +609,7 @@ class PplxGardenAll2AllHandle:
     def __init__(
         self,
         *,
-        kernel=None,
-        kernels=None,
+        kernel,
         max_recv_tokens: int = 0,
         num_local_experts: int,
         rank_expert_offset: int,
@@ -618,14 +617,7 @@ class PplxGardenAll2AllHandle:
         node_group: _PplxGardenParallelGroup | None,
         max_tokens_per_expert: int,
     ) -> None:
-        if kernels is None:
-            assert kernel is not None
-            kernels = [kernel]
-        assert kernels
-        self.kernels = list(kernels)
-        self.kernel = self.kernels[0]
-        self._slot_cond = threading.Condition()
-        self._available_slots = list(range(len(self.kernels)))
+        self.kernel = kernel
         self.max_recv_tokens = max_recv_tokens
         self.max_tokens_per_expert = max_tokens_per_expert
         self.num_local_experts = num_local_experts
@@ -633,92 +625,16 @@ class PplxGardenAll2AllHandle:
         self.global_group = global_group
         self.node_group = node_group
 
-    def _acquire_kernel_slot(self) -> tuple[int, Any]:
-        with self._slot_cond:
-            while not self._available_slots:
-                self._slot_cond.wait()
-            slot = self._available_slots.pop(0)
-        return slot, self.kernels[slot]
-
-    def _release_kernel_slot(self, slot: int) -> None:
-        with self._slot_cond:
-            if slot not in self._available_slots:
-                self._available_slots.append(slot)
-                self._slot_cond.notify()
-
     def dispatch_async(self, **kwargs):
-        slot, kernel = self._acquire_kernel_slot()
-        try:
-            dispatch_handle = kernel.dispatch_async(**kwargs)
-        except Exception:
-            self._release_kernel_slot(slot)
-            raise
-        return _PplxGardenDispatchHandle(self, slot, kernel, dispatch_handle)
+        return self.kernel.dispatch_async(**kwargs)
 
     def combine_async(self, *, dispatch_handle, **kwargs):
         return dispatch_handle.combine_async(**kwargs)
 
     def destroy(self) -> None:
-        for kernel in self.kernels:
-            kernel.destroy()
+        self.kernel.destroy()
         if self.node_group is not None:
             self.node_group.destroy()
-
-
-class _PplxGardenDispatchHandle:
-    def __init__(
-        self,
-        owner: PplxGardenAll2AllHandle,
-        slot: int,
-        kernel,
-        backend_handle,
-    ) -> None:
-        self._owner = owner
-        self._slot = slot
-        self._kernel = kernel
-        self.backend_handle = backend_handle
-        self._released = False
-
-    @property
-    def indices(self):
-        return self.backend_handle.indices
-
-    @property
-    def weights(self):
-        return self.backend_handle.weights
-
-    def recv(self) -> None:
-        self.backend_handle.recv()
-
-    def combine_async(self, **kwargs):
-        try:
-            return _PplxGardenCombineHandle(
-                self,
-                self._kernel.combine_async(
-                    dispatch_handle=self.backend_handle,
-                    **kwargs,
-                ),
-            )
-        except Exception:
-            self.release()
-            raise
-
-    def release(self) -> None:
-        if not self._released:
-            self._released = True
-            self._owner._release_kernel_slot(self._slot)
-
-
-class _PplxGardenCombineHandle:
-    def __init__(self, dispatch_handle: _PplxGardenDispatchHandle, backend_handle):
-        self._dispatch_handle = dispatch_handle
-        self.backend_handle = backend_handle
-
-    def recv(self) -> None:
-        try:
-            self.backend_handle.recv()
-        finally:
-            self._dispatch_handle.release()
 
 
 class PplxGardenAll2AllManager(All2AllManagerBase):
@@ -782,12 +698,6 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             1,
         )
 
-        a2a_slots = 2 if os.environ.get("VLLM_PPLX_ENABLE_DBO", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-        ) else 1
-
         return dict(
             max_num_tokens=max_num_tokens_per_dp_rank,
             num_experts=num_global_experts,
@@ -805,7 +715,6 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             max_recv_tokens=max_recv_tokens,
             max_tokens_per_expert=max_num_tokens_per_dp_rank * num_ep_ranks,
             num_local_experts=num_local_experts,
-            a2a_slots=a2a_slots,
         )
 
     def get_handle(self, kwargs):
@@ -815,8 +724,6 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
         logger.debug("PPLX Garden all2all args %s", buffer_kwargs)
 
         def make_handle(**handle_kwargs):
-            from pplx_garden.fabric_lib import TransferEngine
-
             ranks = dist.get_process_group_ranks(self.cpu_group)
             global_group = _PplxGardenParallelGroup(
                 cpu_group=self.cpu_group,
@@ -832,47 +739,16 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             max_recv_tokens = handle_kwargs.pop("max_recv_tokens")
             max_tokens_per_expert = handle_kwargs.pop("max_tokens_per_expert")
             num_local_experts = handle_kwargs.pop("num_local_experts")
-            a2a_slots = handle_kwargs.pop("a2a_slots")
-            shared_transfer_engine = None
-            topo_group = None
-            if a2a_slots > 1:
-                system_topo = TransferEngine.detect_topology()
-                device_index = global_group.device.index
-                groups = [group for group in system_topo if group.cuda_device == device_index]
-                if len(groups) == 1:
-                    group = groups[0]
-                elif device_index is not None and 0 <= device_index < len(system_topo):
-                    group = system_topo[device_index]
-                else:
-                    raise RuntimeError(f"Cannot identify topology group for cuda:{device_index}")
-                topo_group = group
-                if len(group.cpus) < 2:
-                    raise RuntimeError(f"Not enough CPUs in device group for cuda:{device_index}")
-                domain_cpu, uvm_cpu, *_ = group.cpus
-                nets_per_gpu = handle_kwargs["nets_per_gpu"]
-                domains = group.domains[:nets_per_gpu]
-                builder = TransferEngine.builder()
-                builder.add_gpu_domains(group.cuda_device, domains, domain_cpu, uvm_cpu)
-                shared_transfer_engine = builder.build()
-            kernels = []
-            for slot in range(a2a_slots):
-                worker_cpu = None
-                if topo_group is not None:
-                    cpu_index = min(slot + 3, max(0, len(topo_group.cpus) - 1))
-                    worker_cpu = topo_group.cpus[cpu_index]
-                kernels.append(P2PAllToAll(
-                    **handle_kwargs,
-                    device=global_group.device,
-                    dp_group=None,
-                    node_group=node_group,
-                    global_group=global_group,
-                    imm_base=0x80000000 + slot * 0x100,
-                    transfer_engine=shared_transfer_engine,
-                    worker_cpu=worker_cpu,
-                    max_tokens_per_expert=max_tokens_per_expert,
-                ))
+            kernel = P2PAllToAll(
+                **handle_kwargs,
+                device=global_group.device,
+                dp_group=None,
+                node_group=node_group,
+                global_group=global_group,
+                max_tokens_per_expert=max_tokens_per_expert,
+            )
             return PplxGardenAll2AllHandle(
-                kernels=kernels,
+                kernel=kernel,
                 max_recv_tokens=max_recv_tokens,
                 max_tokens_per_expert=max_tokens_per_expert,
                 num_local_experts=num_local_experts,
