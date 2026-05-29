@@ -917,8 +917,6 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         top_k: int,
         num_experts: int,
         hidden_size: int,
-        dispatch_dtype_bytes_per_elem: int = 0,
-        dispatch_scale_bytes_per_token: int = 0,
     ):
         """Initialize (or grow) the MoeAlltoAll workspace."""
         if dispatch_dtype_bytes_per_elem == 0:
