@@ -8,6 +8,9 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.device_communicators.all2all import PplxGardenAll2AllHandle
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceDelegate,
+)
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
@@ -18,7 +21,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     Prepare/Finalize using PPLX Garden's CXI/RDMA P2P all-to-all.
 
     This first integration intentionally targets the GH200/CXI path we are
-    benchmarking: unquantized activations, TP=1, and synchronous dispatch/combine.
+    benchmarking: unquantized activations, TP=1, and async dispatch/combine.
     """
 
     def __init__(
@@ -27,14 +30,12 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         num_local_experts: int,
-        rank_expert_offset: int,
     ) -> None:
         super().__init__()
         self.handle = handle
         self.max_tokens_per_rank = max_tokens_per_rank
         self.num_dispatchers_ = num_dispatchers
         self.num_local_experts = num_local_experts
-        self.rank_expert_offset = rank_expert_offset
         self._dispatch_handles: dict[int, object] = {}
 
     @property
@@ -67,7 +68,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        prepare_ret = self.prepare_async(
+        hook, receiver = self.prepare_async(
             a1,
             topk_weights,
             topk_ids,
@@ -77,12 +78,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             quant_config,
             defer_input_quant=defer_input_quant,
         )
-        if isinstance(prepare_ret, tuple):
-            hook, receiver = prepare_ret
-        else:
-            hook, receiver = None, prepare_ret
-        if hook is not None:
-            hook()
+        hook()
         return receiver()
 
     def prepare_async(
@@ -95,7 +91,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
-    ) -> tuple[Callable[[], None] | None, mk.ReceiverType] | mk.ReceiverType:
+    ) -> tuple[Callable[[], None], mk.ReceiverType]:
         del expert_map, num_experts
         if quant_config.quant_dtype is not None and not defer_input_quant:
             raise NotImplementedError(
@@ -109,6 +105,9 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             a1 = a1 * topk_weights.to(a1.dtype)
 
         ubatch_id = dbo_current_ubatch_id()
+        assert ubatch_id not in self._dispatch_handles, (
+            f"stale PPLX Garden dispatch handle for ubatch {ubatch_id}"
+        )
         original_topk_ids = topk_ids.to(torch.uint32).contiguous()
         original_topk_weights = (
             torch.ones_like(topk_weights)
@@ -140,11 +139,17 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
         self._dispatch_handles[ubatch_id] = dispatch_handle
 
-        def hook() -> None:
+        recv_done = False
+
+        def recv_dispatch() -> None:
+            nonlocal recv_done
+            if recv_done:
+                return
             dispatch_handle.recv()
+            recv_done = True
 
         def receiver() -> mk.PrepareResultType:
-            hook()
+            recv_dispatch()
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
             )
@@ -156,7 +161,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 None,
             )
 
-        return hook, receiver
+        return recv_dispatch, receiver
 
     def finalize(
         self,
@@ -167,7 +172,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
-        finalize_ret = self.finalize_async(
+        hook, receiver = self.finalize_async(
             output,
             fused_expert_output,
             topk_weights,
@@ -175,12 +180,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             apply_router_weight_on_input,
             weight_and_reduce_impl,
         )
-        if isinstance(finalize_ret, tuple):
-            hook, receiver = finalize_ret
-        else:
-            hook, receiver = None, finalize_ret
-        if hook is not None:
-            hook()
+        hook()
         receiver()
 
     def finalize_async(
@@ -191,8 +191,12 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
-    ) -> tuple[Callable[[], None] | None, Callable[[], None]] | Callable[[], None]:
-        del apply_router_weight_on_input, topk_weights, topk_ids, weight_and_reduce_impl
+    ) -> tuple[Callable[[], None], Callable[[], None]]:
+        assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate), (
+            "Weight application and reduction happens in the PPLX Garden "
+            "combine kernel."
+        )
+        del apply_router_weight_on_input, topk_weights, topk_ids
         ubatch_id = dbo_current_ubatch_id()
         assert ubatch_id in self._dispatch_handles
         dispatch_handle = self._dispatch_handles[ubatch_id]
@@ -202,14 +206,23 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             assert fused_expert_output.shape[1] == self.handle.max_tokens_per_expert
 
         expert_y_send = fused_expert_output.contiguous()
-        combine_handle = self.handle.combine_async(
-            out_tokens=output,
-            dispatch_handle=dispatch_handle,
-            expert_y=expert_y_send,
-        )
+        try:
+            combine_handle = dispatch_handle.combine_async(
+                out_tokens=output,
+                expert_y=expert_y_send,
+            )
+        except Exception:
+            self._dispatch_handles.pop(ubatch_id, None)
+            raise
 
-        def hook() -> None:
+        recv_done = False
+
+        def recv_combine() -> None:
+            nonlocal recv_done
+            if recv_done:
+                return
             combine_handle.recv()
+            recv_done = True
             self._dispatch_handles.pop(ubatch_id, None)
 
-        return hook, lambda: None
+        return recv_combine, lambda: None

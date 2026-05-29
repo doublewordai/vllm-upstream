@@ -18,7 +18,6 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_two_sided,
 )
 from vllm.utils.import_utils import has_deep_ep, has_mori, has_pplx_garden
-from vllm.utils.math_utils import cdiv, round_up
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -616,26 +615,15 @@ class PplxGardenAll2AllHandle:
         self,
         *,
         kernel,
-        max_recv_tokens: int = 0,
-        num_local_experts: int,
-        rank_expert_offset: int,
-        global_group: _PplxGardenParallelGroup,
         node_group: _PplxGardenParallelGroup | None,
         max_tokens_per_expert: int,
     ) -> None:
         self.kernel = kernel
-        self.max_recv_tokens = max_recv_tokens
         self.max_tokens_per_expert = max_tokens_per_expert
-        self.num_local_experts = num_local_experts
-        self.rank_expert_offset = rank_expert_offset
-        self.global_group = global_group
         self.node_group = node_group
 
     def dispatch_async(self, **kwargs):
         return self.kernel.dispatch_async(**kwargs)
-
-    def combine_async(self, *, dispatch_handle, **kwargs):
-        return dispatch_handle.combine_async(**kwargs)
 
     def destroy(self) -> None:
         self.kernel.destroy()
@@ -651,6 +639,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
         )
         super().__init__(cpu_group, tcp_store_group)
         self.handle_cache = Cache()
+        self._ranks = dist.get_process_group_ranks(self.cpu_group)
 
     def _make_all2all_kwargs(
         self,
@@ -660,17 +649,22 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
         output_dtype: torch.dtype,
         num_ep_ranks: int,
         num_global_experts: int,
-        num_local_experts: int,
         num_experts_per_token: int,
     ) -> dict[str, Any]:
-        max_private_tokens = int(os.environ.get("VLLM_PPLX_GARDEN_MAX_PRIVATE_TOKENS", "0"))
+        max_private_tokens = int(
+            os.environ.get("VLLM_PPLX_GARDEN_MAX_PRIVATE_TOKENS", "0")
+        )
         if max_private_tokens <= 0:
             max_private_tokens = None
 
         nets_per_gpu = int(os.environ.get("VLLM_PPLX_GARDEN_NETS_PER_GPU", "1"))
         local_size = max(torch.cuda.device_count(), 1)
         nvlink_group_size = min(local_size, num_ep_ranks)
-        if os.environ.get("VLLM_PPLX_GARDEN_DISABLE_NVLINK", "0").lower() in ("1", "true", "yes"):
+        if os.environ.get("VLLM_PPLX_GARDEN_DISABLE_NVLINK", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
             nvlink_group_size = 1
 
         if self.tp_group.world_size != 1:
@@ -678,31 +672,6 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                 "pplx_garden all2all currently supports expert parallelism with "
                 "tensor_parallel_size=1 only."
             )
-
-        num_dp_groups = num_ep_ranks
-        avg_tokens_per_expert = int(
-            cdiv(
-                max_num_tokens_per_dp_rank * num_experts_per_token,
-                num_global_experts,
-            )
-            * 1.2
-        )
-        private_tokens = (
-            avg_tokens_per_expert * num_local_experts
-            if max_private_tokens is None
-            else max_private_tokens
-        )
-        num_tokens = max_num_tokens_per_dp_rank * num_dp_groups
-        max_recv_tokens = private_tokens * num_dp_groups + round_up(
-            max(
-                min(
-                    num_tokens * num_experts_per_token,
-                    num_tokens * num_local_experts,
-                ),
-                num_local_experts,
-            ),
-            1,
-        )
 
         return dict(
             max_num_tokens=max_num_tokens_per_dp_rank,
@@ -718,9 +687,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             nets_per_gpu=nets_per_gpu,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             nvlink_group_size=nvlink_group_size,
-            max_recv_tokens=max_recv_tokens,
             max_tokens_per_expert=max_num_tokens_per_dp_rank * num_ep_ranks,
-            num_local_experts=num_local_experts,
         )
 
     def get_handle(self, kwargs):
@@ -730,11 +697,10 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
         logger.debug("PPLX Garden all2all args %s", buffer_kwargs)
 
         def make_handle(**handle_kwargs):
-            ranks = dist.get_process_group_ranks(self.cpu_group)
             global_group = _PplxGardenParallelGroup(
                 cpu_group=self.cpu_group,
                 device=handle_kwargs.pop("device"),
-                ranks=ranks,
+                ranks=self._ranks,
             )
             nvlink_group_size = handle_kwargs.pop("nvlink_group_size")
             node_group = None
@@ -742,9 +708,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                 node_group = global_group.slice_by_count(
                     global_group.size // nvlink_group_size
                 )
-            max_recv_tokens = handle_kwargs.pop("max_recv_tokens")
             max_tokens_per_expert = handle_kwargs.pop("max_tokens_per_expert")
-            num_local_experts = handle_kwargs.pop("num_local_experts")
             kernel = P2PAllToAll(
                 **handle_kwargs,
                 device=global_group.device,
@@ -755,11 +719,7 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
             )
             return PplxGardenAll2AllHandle(
                 kernel=kernel,
-                max_recv_tokens=max_recv_tokens,
                 max_tokens_per_expert=max_tokens_per_expert,
-                num_local_experts=num_local_experts,
-                rank_expert_offset=self.rank * num_local_experts,
-                global_group=global_group,
                 node_group=node_group,
             )
 
