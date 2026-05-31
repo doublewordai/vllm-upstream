@@ -207,8 +207,9 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         expert_y_send = fused_expert_output.contiguous()
         try:
-            combine_handle = dispatch_handle.combine_async(
+            combine_handle = self.handle.combine_async(
                 out_tokens=output,
+                dispatch_handle=dispatch_handle,
                 expert_y=expert_y_send,
             )
         except Exception:
