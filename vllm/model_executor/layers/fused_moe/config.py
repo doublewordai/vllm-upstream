@@ -1061,7 +1061,11 @@ class FusedMoEParallelConfig:
 
     @property
     def use_batched_activation_format(self):
-        return self.use_deepep_ll_kernels or self.use_nixl_ep_kernels
+        return (
+            self.use_deepep_ll_kernels
+            or self.use_nixl_ep_kernels
+            or self.use_pplx_garden_kernels
+        )
 
     @property
     def needs_round_robin_routing_tables(self):
