@@ -625,6 +625,9 @@ class PplxGardenAll2AllHandle:
     def dispatch_async(self, **kwargs):
         return self.kernel.dispatch_async(**kwargs)
 
+    def combine_async(self, **kwargs):
+        return self.kernel.combine_async(**kwargs)
+
     def destroy(self) -> None:
         self.kernel.destroy()
         if self.node_group is not None:
