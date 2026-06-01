@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import faulthandler
 import multiprocessing
 import os
 import pickle
@@ -810,6 +811,8 @@ class WorkerProc:
         # Either SIGTERM or SIGINT will terminate the worker
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, "SIGUSR2"):
+            faulthandler.register(signal.SIGUSR2, all_threads=True)
 
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
