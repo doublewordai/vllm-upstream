@@ -720,6 +720,10 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                 global_group=global_group,
                 max_tokens_per_expert=max_tokens_per_expert,
             )
+            # PPLX Garden handle construction maps CUDA buffers and initializes
+            # device-side sync memory. Keep that setup from leaking queued CUDA
+            # work into the following profile/cudagraph warmup forwards.
+            torch.cuda.synchronize(global_group.device)
             return PplxGardenAll2AllHandle(
                 kernel=kernel,
                 max_tokens_per_expert=max_tokens_per_expert,
