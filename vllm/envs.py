@@ -248,6 +248,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_MHC_USE_TILELANG: bool = True
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -1827,6 +1828,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             and __import__("torch").version.hip is not None
             else "20",
         )
+    ),
+    # Use TileLang kernels for DeepSeek V4 multi-head compression. Disable
+    # this to use the unfused PyTorch/Triton fallback path.
+    "VLLM_MHC_USE_TILELANG": lambda: bool(
+        int(os.getenv("VLLM_MHC_USE_TILELANG", "1"))
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
     # to compile static shapes passed from compile_sizes in compilation_config

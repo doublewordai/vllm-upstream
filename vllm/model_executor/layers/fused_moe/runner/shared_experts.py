@@ -87,7 +87,9 @@ class SharedExperts:
         return (
             parallel_config.enable_eplb
             and parallel_config.all2all_backend != "allgather_reducescatter"
-        ) or parallel_config.use_fi_nvl_two_sided_kernels
+        ) or parallel_config.use_fi_nvl_two_sided_kernels or (
+            parallel_config.all2all_backend == "pplx_garden"
+        )
 
     def _determine_shared_experts_order(
         self,

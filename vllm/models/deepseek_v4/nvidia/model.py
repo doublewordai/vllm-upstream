@@ -35,6 +35,7 @@ from vllm.model_executor.layers.mhc import (
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
+    use_tilelang_mhc,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -1063,7 +1064,11 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        if (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or not use_tilelang_mhc()
+        ):
             return self._forward_native(
                 x, positions, input_ids, post_mix, res_mix, residual
             )

@@ -737,6 +737,12 @@ class WorkerProc:
                     unready_proc_handle = pipes.pop(pipe)
                     response: dict[str, Any] = pipe.recv()
                     if response["status"] != "READY":
+                        error = response.get("error")
+                        if error is not None:
+                            e.add_note(f"rank {unready_proc_handle.rank}: {error}")
+                        traceback_str = response.get("traceback")
+                        if traceback_str is not None:
+                            e.add_note(traceback_str)
                         raise e
 
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
@@ -744,6 +750,14 @@ class WorkerProc:
                         response, unready_proc_handle
                     )
                 except EOFError:
+                    proc = unready_proc_handle.proc
+                    proc.join(timeout=0)
+                    e.add_note(
+                        "rank "
+                        f"{unready_proc_handle.rank} exited before READY: "
+                        f"pid={proc.pid}, exitcode={proc.exitcode}, "
+                        f"alive={proc.is_alive()}"
+                    )
                     e.__suppress_context__ = True
                     raise e from None
 
@@ -871,6 +885,16 @@ class WorkerProc:
 
             if ready_writer is not None:
                 logger.exception("WorkerProc failed to start.")
+                try:
+                    ready_writer.send(
+                        {
+                            "status": "ERROR",
+                            "error": traceback.format_exc(limit=1),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                except Exception:
+                    logger.exception("Failed to send WorkerProc startup error.")
             elif shutdown_requested.is_set():
                 logger.info("WorkerProc shutting down.")
             else:

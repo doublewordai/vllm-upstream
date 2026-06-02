@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
@@ -9,6 +10,10 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+
+
+def use_tilelang_mhc() -> bool:
+    return HAS_TILELANG and envs.VLLM_MHC_USE_TILELANG
 
 
 # --8<-- [start:mhc_pre]
@@ -41,6 +46,21 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not use_tilelang_mhc():
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -89,7 +109,7 @@ class MHCPreOp(CustomOp):
         #         sinkhorn_repeat,
         #     )
         # else:
-        if HAS_TILELANG:
+        if use_tilelang_mhc():
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
                 fn,
@@ -170,6 +190,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if not use_tilelang_mhc():
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -194,7 +216,7 @@ class MHCPostOp(CustomOp):
         #         comb_res_mix,
         #     )
         # else:
-        if HAS_TILELANG:
+        if use_tilelang_mhc():
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
@@ -240,6 +262,15 @@ class HCHeadOp(CustomOp):
         rms_norm_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
+        if not use_tilelang_mhc():
+            return self.forward_hip(
+                hidden_states,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
@@ -279,7 +310,7 @@ class HCHeadOp(CustomOp):
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
 
-        if HAS_TILELANG:
+        if use_tilelang_mhc():
             torch.ops.vllm.hc_head_fused_kernel_tilelang(
                 hs_flat,
                 hc_fn,

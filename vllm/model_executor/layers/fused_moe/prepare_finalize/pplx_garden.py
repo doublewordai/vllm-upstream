@@ -2,18 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+import os
+import threading
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.device_communicators.all2all import PplxGardenAll2AllHandle
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
+    dbo_maybe_run_recv_hook,
 )
+
+logger = init_logger(__name__)
 
 
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -26,17 +32,44 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def __init__(
         self,
-        handle: PplxGardenAll2AllHandle,
+        *,
+        handle: PplxGardenAll2AllHandle | None = None,
+        handle_factory: Callable[[], PplxGardenAll2AllHandle] | None = None,
+        max_tokens_per_expert: int | None = None,
         max_tokens_per_rank: int,
         num_dispatchers: int,
         num_local_experts: int,
     ) -> None:
         super().__init__()
-        self.handle = handle
+        assert handle is not None or handle_factory is not None
+        self._handle = handle
+        self._handle_factory = handle_factory
+        self._handle_lock = threading.Lock()
+        self._max_tokens_per_expert = max_tokens_per_expert
         self.max_tokens_per_rank = max_tokens_per_rank
         self.num_dispatchers_ = num_dispatchers
         self.num_local_experts = num_local_experts
         self._dispatch_handles: dict[int, object] = {}
+
+    @property
+    def handle(self) -> PplxGardenAll2AllHandle:
+        handle = self._handle
+        if handle is not None:
+            return handle
+
+        with self._handle_lock:
+            handle = self._handle
+            if handle is None:
+                assert self._handle_factory is not None
+                handle = self._handle_factory()
+                self._handle = handle
+        return handle
+
+    @property
+    def max_tokens_per_expert(self) -> int:
+        if self._max_tokens_per_expert is not None:
+            return self._max_tokens_per_expert
+        return self.handle.max_tokens_per_expert
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -121,7 +154,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_x = torch.empty(
             (
                 self.num_local_experts,
-                self.handle.max_tokens_per_expert,
+                self.max_tokens_per_expert,
                 a1.shape[1],
             ),
             dtype=a1.dtype,
@@ -203,9 +236,46 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         if fused_expert_output.ndim == 3:
             assert fused_expert_output.shape[0] == self.num_local_experts
-            assert fused_expert_output.shape[1] == self.handle.max_tokens_per_expert
+            assert fused_expert_output.shape[1] == self.max_tokens_per_expert
+        if fused_expert_output.dtype != output.dtype:
+            raise TypeError(
+                "PPLX Garden combine expected expert output dtype to match "
+                f"output dtype, got expert_y={fused_expert_output.dtype}, "
+                f"output={output.dtype}"
+            )
+        if fused_expert_output.shape[-1] != output.shape[-1]:
+            raise ValueError(
+                "PPLX Garden combine expected expert output hidden size to "
+                f"match output hidden size, got expert_y={fused_expert_output.shape[-1]}, "
+                f"output={output.shape[-1]}"
+            )
+        logger.info_once(
+            "PPLX Garden combine: output=%s %s expert_y=%s %s",
+            tuple(output.shape),
+            output.dtype,
+            tuple(fused_expert_output.shape),
+            fused_expert_output.dtype,
+        )
+        if os.environ.get("PPLX_GARDEN_TRACE") == "1":
+            counts = dispatch_handle.out_expert_num_tokens.detach().cpu()
+            logger.warning(
+                "PPLX Garden dispatch counts: max=%s sum=%s "
+                "limit_per_expert=%s counts=%s",
+                int(counts.max().item()) if counts.numel() else 0,
+                int(counts.sum().item()),
+                self.max_tokens_per_expert,
+                counts.tolist(),
+            )
 
-        expert_y_send = fused_expert_output.contiguous()
+        if os.environ.get("PPLX_GARDEN_DEBUG_CLONE_EXPERT_Y") == "1":
+            expert_y_send = fused_expert_output.contiguous().clone()
+        else:
+            expert_y_send = fused_expert_output.contiguous()
+        if expert_y_send.ndim == 3:
+            expert_y_send = expert_y_send.view(-1, expert_y_send.shape[-1])
+        if os.environ.get("PPLX_GARDEN_DEBUG_SYNC_BEFORE_COMBINE") == "1":
+            torch.cuda.synchronize(output.device)
+        dbo_maybe_run_recv_hook()
         try:
             combine_handle = self.handle.combine_async(
                 out_tokens=output,

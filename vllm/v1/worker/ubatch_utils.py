@@ -41,9 +41,9 @@ def check_ubatch_thresholds(
     if not config.use_ubatching:
         return False
     if uniform_decode:
-        return num_tokens >= config.dbo_decode_token_threshold
+        return num_tokens >= config.dbo_decode_token_threshold * config.num_ubatches
     else:
-        return num_tokens >= config.dbo_prefill_token_threshold
+        return num_tokens >= config.dbo_prefill_token_threshold * config.num_ubatches
 
 
 # This pads the last ubatch slice out to the total number of tokens
@@ -67,6 +67,7 @@ def maybe_create_ubatch_slices(
     num_reqs_padded: int,
     num_ubatches: int,
     split_point: list[int] | int | None = None,
+    split_point_alignment: int = 1,
 ) -> tuple[UBatchSlices | None, UBatchSlices | None]:
     if not should_ubatch:
         return None, None
@@ -74,7 +75,29 @@ def maybe_create_ubatch_slices(
     if split_point is None:
         split_point = int(num_tokens_padded) // num_ubatches
 
-    token_split_points = [split_point * i for i in range(1, num_ubatches)]
+    if isinstance(split_point, int):
+        token_split_points = [split_point * i for i in range(1, num_ubatches)]
+    else:
+        token_split_points = split_point
+
+    if split_point_alignment > 1:
+        total_tokens = int(num_tokens_padded)
+        aligned_split_points = []
+        prev = 0
+        for i, point in enumerate(token_split_points):
+            lower = (int(point) // split_point_alignment) * split_point_alignment
+            upper = lower + split_point_alignment
+            candidates = [
+                p for p in (lower, upper) if prev < p < total_tokens
+            ]
+            if candidates:
+                point = min(candidates, key=lambda p: abs(p - int(point)))
+            min_point = prev + 1
+            max_point = total_tokens - (len(token_split_points) - i)
+            point = min(max(int(point), min_point), max_point)
+            aligned_split_points.append(point)
+            prev = point
+        token_split_points = aligned_split_points
 
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)
@@ -231,6 +254,13 @@ def _make_metadata_with_slice(
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
+    positions = None
+    if attn_metadata.positions is not None:
+        positions = (
+            attn_metadata.positions[:, token_slice]
+            if attn_metadata.positions.ndim == 2
+            else attn_metadata.positions[token_slice]
+        )
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
@@ -242,6 +272,7 @@ def _make_metadata_with_slice(
         max_seq_len=max_seq_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        positions=positions,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,

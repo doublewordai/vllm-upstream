@@ -245,9 +245,11 @@ def maybe_make_prepare_finalize(
             num_global_experts=moe.num_experts,
             num_experts_per_token=moe.experts_per_token,
         )
-        handle = all2all_manager.get_handle(all_to_all_args)
         prepare_finalize = PplxGardenPrepareAndFinalize(
-            handle,
+            handle_factory=lambda: all2all_manager.get_handle(all_to_all_args),
+            max_tokens_per_expert=(
+                moe.max_num_tokens * all2all_manager.world_size
+            ),
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             num_local_experts=moe.num_experts // all2all_manager.world_size,

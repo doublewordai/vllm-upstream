@@ -215,6 +215,12 @@ class CoreEngineProcManager:
             for sentinel in died_sentinels:
                 proc = sentinel_to_proc.pop(cast(int, sentinel))
                 exitcode = proc.exitcode
+                logger.warning(
+                    "Engine core process %s (PID: %s) exited with code %s",
+                    proc.name,
+                    proc.pid,
+                    exitcode,
+                )
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
             if died_sentinels:

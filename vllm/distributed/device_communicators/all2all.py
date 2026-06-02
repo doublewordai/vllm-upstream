@@ -698,6 +698,16 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
 
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("PPLX Garden all2all args %s", buffer_kwargs)
+        if os.environ.get("PPLX_GARDEN_TRACE") == "1":
+            logger.warning(
+                "PPLX Garden handle create: rank=%s world_size=%s "
+                "current_device=%s selected_device=%s cuda_visible_devices=%s",
+                self.rank,
+                self.world_size,
+                torch.cuda.current_device(),
+                buffer_kwargs["device"],
+                os.environ.get("CUDA_VISIBLE_DEVICES"),
+            )
 
         def make_handle(**handle_kwargs):
             global_group = _PplxGardenParallelGroup(
@@ -712,14 +722,15 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                     global_group.size // nvlink_group_size
                 )
             max_tokens_per_expert = handle_kwargs.pop("max_tokens_per_expert")
-            kernel = P2PAllToAll(
-                **handle_kwargs,
-                device=global_group.device,
-                dp_group=None,
-                node_group=node_group,
-                global_group=global_group,
-                max_tokens_per_expert=max_tokens_per_expert,
-            )
+            with torch.cuda.device(global_group.device):
+                kernel = P2PAllToAll(
+                    **handle_kwargs,
+                    device=global_group.device,
+                    dp_group=None,
+                    node_group=node_group,
+                    global_group=global_group,
+                    max_tokens_per_expert=max_tokens_per_expert,
+                )
             return PplxGardenAll2AllHandle(
                 kernel=kernel,
                 max_tokens_per_expert=max_tokens_per_expert,

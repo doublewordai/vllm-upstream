@@ -4085,6 +4085,7 @@ class GPUModelRunner(
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
+                split_point_alignment=16 if batch_desc.uniform else 1,
             )
 
             logger.debug(
@@ -5682,6 +5683,7 @@ class GPUModelRunner(
             num_tokens_padded,
             num_reqs_padded,
             self.vllm_config.parallel_config.num_ubatches,
+            split_point_alignment=16 if batch_desc.uniform else 1,
         )
         logger.debug(
             "ubatch_slices: %s, ubatch_slices_padded: %s",
