@@ -22,6 +22,22 @@ from vllm.v1.worker.ubatching import (
 logger = init_logger(__name__)
 
 
+def _pplx_debug_timeout_seconds() -> float:
+    timeout = os.environ.get("VLLM_PPLX_GARDEN_DEBUG_STATE_TIMEOUT_S")
+    if timeout is None:
+        timeout = os.environ.get("PPLX_GARDEN_DEBUG_STATE_TIMEOUT_S")
+    if timeout is None:
+        return 0.0
+    try:
+        return max(float(timeout), 0.0)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid PPLX debug timeout %r; expected seconds.",
+            timeout,
+        )
+        return 0.0
+
+
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using PPLX Garden's CXI/RDMA P2P all-to-all.
@@ -50,6 +66,34 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.num_local_experts = num_local_experts
         self._dispatch_handles: dict[int, object] = {}
+
+    def _log_debug_state(self, where: str) -> None:
+        try:
+            state = self.handle.get_debug_state()
+        except Exception:
+            logger.exception("Failed to read PPLX Garden debug state at %s", where)
+            return
+        logger.warning("PPLX Garden debug state at %s: %s", where, state)
+
+    def _call_with_debug_state(
+        self,
+        where: str,
+        fn: Callable[[], object],
+    ) -> object:
+        timer: threading.Timer | None = None
+        timeout_s = _pplx_debug_timeout_seconds()
+        if timeout_s > 0:
+            timer = threading.Timer(timeout_s, self._log_debug_state, args=(where,))
+            timer.daemon = True
+            timer.start()
+        try:
+            return fn()
+        except Exception:
+            self._log_debug_state(f"{where} exception")
+            raise
+        finally:
+            if timer is not None:
+                timer.cancel()
 
     @property
     def handle(self) -> PplxGardenAll2AllHandle:
@@ -161,15 +205,19 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             device=a1.device,
         )
         dp_x = a1.contiguous()
-        dispatch_handle = self.handle.dispatch_async(
-            out_expert_num_tokens=expert_num_tokens,
-            out_expert_x=expert_x,
-            out_expert_x_scale=None,
-            dp_x=dp_x,
-            dp_x_scale=None,
-            indices=original_topk_ids,
-            weights=original_topk_weights,
-        )
+        try:
+            dispatch_handle = self.handle.dispatch_async(
+                out_expert_num_tokens=expert_num_tokens,
+                out_expert_x=expert_x,
+                out_expert_x_scale=None,
+                dp_x=dp_x,
+                dp_x_scale=None,
+                indices=original_topk_ids,
+                weights=original_topk_weights,
+            )
+        except Exception:
+            self._log_debug_state(f"dispatch enqueue ubatch={ubatch_id} exception")
+            raise
         self._dispatch_handles[ubatch_id] = dispatch_handle
 
         recv_done = False
@@ -178,7 +226,10 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             nonlocal recv_done
             if recv_done:
                 return
-            dispatch_handle.recv()
+            self._call_with_debug_state(
+                f"dispatch recv ubatch={ubatch_id}",
+                dispatch_handle.recv,
+            )
             recv_done = True
 
         def receiver() -> mk.PrepareResultType:
@@ -291,6 +342,7 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 expert_y=expert_y_send,
             )
         except Exception:
+            self._log_debug_state(f"combine enqueue ubatch={ubatch_id} exception")
             self._dispatch_handles.pop(ubatch_id, None)
             raise
 
@@ -300,7 +352,10 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             nonlocal recv_done
             if recv_done:
                 return
-            combine_handle.recv()
+            self._call_with_debug_state(
+                f"combine recv ubatch={ubatch_id}",
+                combine_handle.recv,
+            )
             recv_done = True
             self._dispatch_handles.pop(ubatch_id, None)
 

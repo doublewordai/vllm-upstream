@@ -628,6 +628,12 @@ class PplxGardenAll2AllHandle:
     def combine_async(self, **kwargs):
         return self.kernel.combine_async(**kwargs)
 
+    def get_debug_state(self):
+        get_debug_state = getattr(self.kernel, "get_debug_state", None)
+        if get_debug_state is None:
+            return None
+        return get_debug_state()
+
     def destroy(self) -> None:
         self.kernel.destroy()
         if self.node_group is not None:
