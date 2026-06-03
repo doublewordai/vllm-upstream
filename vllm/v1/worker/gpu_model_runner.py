@@ -6592,6 +6592,14 @@ class GPUModelRunner(
                 )
                 torch.accelerator.synchronize()
             except Exception:
+                try:
+                    from vllm.model_executor.layers.fused_moe.prepare_finalize.pplx_garden import (  # noqa: E501
+                        dump_pplx_event_trace,
+                    )
+
+                    dump_pplx_event_trace("CUDA graph capture failure")
+                except Exception:
+                    logger.exception("Failed to dump PPLX Garden event trace")
                 logger.exception(
                     "CUDA graph capture failed: index=%d/%d mode=%s "
                     "num_tokens=%d num_reqs=%s uniform=%s has_lora=%s "
