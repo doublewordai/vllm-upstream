@@ -6,6 +6,7 @@ import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -65,6 +66,26 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOu
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+
+def _start_worker_startup_stack_dump_timer(rank: int) -> threading.Timer | None:
+    timeout_s = envs.VLLM_WORKER_STARTUP_STACK_DUMP_TIMEOUT_S
+    if timeout_s <= 0:
+        return None
+
+    def dump_stacks() -> None:
+        logger.error(
+            "WorkerProc rank %d has not reached READY after %d seconds; "
+            "dumping Python stacks.",
+            rank,
+            timeout_s,
+        )
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+    timer = threading.Timer(timeout_s, dump_stacks)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 class FutureWrapper(Future):
@@ -831,6 +852,7 @@ class WorkerProc:
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
+        startup_stack_dump_timer: threading.Timer | None = None
 
         # Close inherited pipes from parent (incl. other worker pipes)
         # Explicitly passing in existing pipes and closing them makes the pipe
@@ -845,6 +867,7 @@ class WorkerProc:
         try:
             # Initialize tracer
             rank = kwargs.get("rank", 0)
+            startup_stack_dump_timer = _start_worker_startup_stack_dump_timer(rank)
             maybe_init_worker_tracer(
                 instrumenting_module_name="vllm.worker",
                 process_kind="worker",
@@ -866,6 +889,9 @@ class WorkerProc:
                     "peer_response_handles": worker.peer_response_handles,
                 }
             )
+            if startup_stack_dump_timer is not None:
+                startup_stack_dump_timer.cancel()
+                startup_stack_dump_timer = None
 
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
@@ -913,6 +939,8 @@ class WorkerProc:
             raise e
 
         finally:
+            if startup_stack_dump_timer is not None:
+                startup_stack_dump_timer.cancel()
             if ready_writer is not None:
                 ready_writer.close()
             if death_pipe is not None:
