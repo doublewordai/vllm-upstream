@@ -256,7 +256,15 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             tuple(fused_expert_output.shape),
             fused_expert_output.dtype,
         )
-        if os.environ.get("PPLX_GARDEN_TRACE") == "1":
+        if (
+            os.environ.get("PPLX_GARDEN_TRACE") == "1"
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            logger.warning(
+                "PPLX Garden dispatch counts trace omitted during CUDA graph "
+                "capture to avoid CPU/GPU copies."
+            )
+        elif os.environ.get("PPLX_GARDEN_TRACE") == "1":
             counts = dispatch_handle.out_expert_num_tokens.detach().cpu()
             logger.warning(
                 "PPLX Garden dispatch counts: max=%s sum=%s "

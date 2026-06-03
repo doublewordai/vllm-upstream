@@ -6305,7 +6305,16 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
 
             for mode, descs in capture_descs:
-                profile_descs = descs[:2]
+                if self._has_pplx_cuda_graph_capture_state():
+                    # PPLX Garden uses persistent cross-rank progress state.
+                    # Profiling multiple graph shapes in the temporary graph
+                    # pool can replay several captured PPLX protocols against
+                    # the same live workers before runtime capture begins.
+                    # Keep profiling to the first descriptor; runtime capture
+                    # below still captures every configured graph shape.
+                    profile_descs = descs[:1]
+                else:
+                    profile_descs = descs[:2]
                 mem_samples: list[int] = []
 
                 for i, desc in enumerate(profile_descs):
@@ -6485,6 +6494,7 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        self._reset_pplx_cuda_graph_capture_slots()
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -6496,6 +6506,26 @@ class GPUModelRunner(
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
         )
+
+    @staticmethod
+    def _reset_pplx_cuda_graph_capture_slots() -> None:
+        try:
+            from pplx_garden.kernels.p2p_all_to_all import (
+                reset_all_cuda_graph_capture_slots,
+            )
+        except ImportError:
+            return
+        reset_all_cuda_graph_capture_slots()
+
+    @staticmethod
+    def _has_pplx_cuda_graph_capture_state() -> bool:
+        try:
+            from pplx_garden.kernels.p2p_all_to_all import (
+                has_cuda_graph_capture_kernels,
+            )
+        except ImportError:
+            return False
+        return has_cuda_graph_capture_kernels()
 
     def _capture_cudagraphs(
         self,
