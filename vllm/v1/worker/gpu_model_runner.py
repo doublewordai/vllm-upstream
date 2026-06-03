@@ -6541,6 +6541,7 @@ class GPUModelRunner(
             return
 
         uniform_decode = batch_descriptors[0].uniform
+        total_descs = len(batch_descriptors)
 
         # Only rank 0 should print progress bar during capture
         if is_global_first_rank():
@@ -6554,7 +6555,7 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for batch_desc in batch_descriptors:
+        for capture_idx, batch_desc in enumerate(batch_descriptors):
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -6569,12 +6570,51 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                 )
             )
-            self._warmup_and_capture(
-                batch_desc,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                allow_microbatching=allow_microbatching,
+            logger.info(
+                "CUDA graph capture start: index=%d/%d mode=%s "
+                "num_tokens=%d num_reqs=%s uniform=%s has_lora=%s "
+                "num_active_loras=%d allow_microbatching=%s",
+                capture_idx + 1,
+                total_descs,
+                cudagraph_runtime_mode.name,
+                batch_desc.num_tokens,
+                batch_desc.num_reqs,
+                batch_desc.uniform,
+                batch_desc.has_lora,
+                batch_desc.num_active_loras,
+                allow_microbatching,
             )
-            torch.accelerator.synchronize()
+            try:
+                self._warmup_and_capture(
+                    batch_desc,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    allow_microbatching=allow_microbatching,
+                )
+                torch.accelerator.synchronize()
+            except Exception:
+                logger.exception(
+                    "CUDA graph capture failed: index=%d/%d mode=%s "
+                    "num_tokens=%d num_reqs=%s uniform=%s has_lora=%s "
+                    "num_active_loras=%d allow_microbatching=%s",
+                    capture_idx + 1,
+                    total_descs,
+                    cudagraph_runtime_mode.name,
+                    batch_desc.num_tokens,
+                    batch_desc.num_reqs,
+                    batch_desc.uniform,
+                    batch_desc.has_lora,
+                    batch_desc.num_active_loras,
+                    allow_microbatching,
+                )
+                raise
+            logger.info(
+                "CUDA graph capture complete: index=%d/%d mode=%s "
+                "num_tokens=%d",
+                capture_idx + 1,
+                total_descs,
+                cudagraph_runtime_mode.name,
+                batch_desc.num_tokens,
+            )
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(
