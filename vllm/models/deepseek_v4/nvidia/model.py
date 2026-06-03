@@ -1181,6 +1181,62 @@ class DeepseekV4Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+    @torch.inference_mode()
+    def prewarm_cudagraph_kernels(self, num_tokens: int) -> None:
+        if current_platform.is_rocm() or current_platform.is_xpu():
+            return
+        if not use_tilelang_mhc() or self.start_layer >= self.end_layer:
+            return
+
+        layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
+        hidden_size = self.config.hidden_size
+        residual = torch.zeros(
+            num_tokens,
+            self.hc_mult,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        x = torch.zeros(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        post_mix = torch.zeros(
+            num_tokens,
+            self.hc_mult,
+            1,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        res_mix = torch.zeros(
+            num_tokens,
+            self.hc_mult,
+            self.hc_mult,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        layer.mhc_fused_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.rms_norm_eps,
+            layer.hc_eps,
+            layer.hc_eps,
+            layer.hc_post_alpha,
+            layer.hc_sinkhorn_iters,
+            n_splits=1,
+            tile_n=1,
+            norm_weight=layer.attn_norm.weight.data,
+            norm_eps=layer.attn_norm.variance_epsilon,
+        )
+        torch.accelerator.synchronize()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1470,6 +1526,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def prewarm_cudagraph_kernels(self, num_tokens: int) -> None:
+        self.model.prewarm_cudagraph_kernels(num_tokens)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])

@@ -6494,6 +6494,11 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        prewarm_cudagraph_kernels = getattr(
+            self.get_model(), "prewarm_cudagraph_kernels", None
+        )
+        if callable(prewarm_cudagraph_kernels):
+            prewarm_cudagraph_kernels(desc.num_tokens)
         self._reset_pplx_cuda_graph_capture_slots()
         self._dummy_run(
             desc.num_tokens,
