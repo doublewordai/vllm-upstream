@@ -38,6 +38,18 @@ def _pplx_debug_timeout_seconds() -> float:
         return 0.0
 
 
+def _pplx_capture_trace_enabled() -> bool:
+    return os.environ.get("PPLX_GARDEN_CAPTURE_TRACE") == "1"
+
+
+def _tensor_trace(tensor: torch.Tensor) -> str:
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} ptr=0x{tensor.data_ptr():x} "
+        f"contiguous={tensor.is_contiguous()}"
+    )
+
+
 class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using PPLX Garden's CXI/RDMA P2P all-to-all.
@@ -185,6 +197,18 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert ubatch_id not in self._dispatch_handles, (
             f"stale PPLX Garden dispatch handle for ubatch {ubatch_id}"
         )
+        if _pplx_capture_trace_enabled():
+            logger.warning(
+                "PPLX Garden capture trace: phase=dispatch_enqueue_start "
+                "ubatch=%s capturing=%s a1=(%s) topk_ids=(%s) "
+                "topk_weights=(%s) live_dispatch_handles=%s",
+                ubatch_id,
+                torch.cuda.is_current_stream_capturing(),
+                _tensor_trace(a1),
+                _tensor_trace(topk_ids),
+                _tensor_trace(topk_weights),
+                sorted(self._dispatch_handles),
+            )
         original_topk_ids = topk_ids.to(torch.uint32).contiguous()
         original_topk_weights = (
             torch.ones_like(topk_weights)
@@ -219,6 +243,22 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self._log_debug_state(f"dispatch enqueue ubatch={ubatch_id} exception")
             raise
         self._dispatch_handles[ubatch_id] = dispatch_handle
+        if _pplx_capture_trace_enabled():
+            logger.warning(
+                "PPLX Garden capture trace: phase=dispatch_enqueue_done "
+                "ubatch=%s capturing=%s dispatch_handle_id=0x%x "
+                "expert_num_tokens=(%s) expert_x=(%s) dp_x=(%s) "
+                "indices=(%s) weights=(%s) live_dispatch_handles=%s",
+                ubatch_id,
+                torch.cuda.is_current_stream_capturing(),
+                id(dispatch_handle),
+                _tensor_trace(expert_num_tokens),
+                _tensor_trace(expert_x),
+                _tensor_trace(dp_x),
+                _tensor_trace(original_topk_ids),
+                _tensor_trace(original_topk_weights),
+                sorted(self._dispatch_handles),
+            )
 
         recv_done = False
 
@@ -226,11 +266,27 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             nonlocal recv_done
             if recv_done:
                 return
+            if _pplx_capture_trace_enabled():
+                logger.warning(
+                    "PPLX Garden capture trace: phase=dispatch_recv_start "
+                    "ubatch=%s capturing=%s dispatch_handle_id=0x%x",
+                    ubatch_id,
+                    torch.cuda.is_current_stream_capturing(),
+                    id(dispatch_handle),
+                )
             self._call_with_debug_state(
                 f"dispatch recv ubatch={ubatch_id}",
                 dispatch_handle.recv,
             )
             recv_done = True
+            if _pplx_capture_trace_enabled():
+                logger.warning(
+                    "PPLX Garden capture trace: phase=dispatch_recv_done "
+                    "ubatch=%s capturing=%s dispatch_handle_id=0x%x",
+                    ubatch_id,
+                    torch.cuda.is_current_stream_capturing(),
+                    id(dispatch_handle),
+                )
 
         def receiver() -> mk.PrepareResultType:
             recv_dispatch()
@@ -334,6 +390,20 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_y_send = expert_y_send.view(-1, expert_y_send.shape[-1])
         if os.environ.get("PPLX_GARDEN_DEBUG_SYNC_BEFORE_COMBINE") == "1":
             torch.cuda.synchronize(output.device)
+        if _pplx_capture_trace_enabled():
+            logger.warning(
+                "PPLX Garden capture trace: phase=combine_enqueue_start "
+                "ubatch=%s capturing=%s dispatch_handle_id=0x%x "
+                "output=(%s) fused_expert_output=(%s) expert_y_send=(%s) "
+                "live_dispatch_handles=%s",
+                ubatch_id,
+                torch.cuda.is_current_stream_capturing(),
+                id(dispatch_handle),
+                _tensor_trace(output),
+                _tensor_trace(fused_expert_output),
+                _tensor_trace(expert_y_send),
+                sorted(self._dispatch_handles),
+            )
         dbo_maybe_run_recv_hook()
         try:
             combine_handle = self.handle.combine_async(
@@ -345,6 +415,17 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self._log_debug_state(f"combine enqueue ubatch={ubatch_id} exception")
             self._dispatch_handles.pop(ubatch_id, None)
             raise
+        if _pplx_capture_trace_enabled():
+            logger.warning(
+                "PPLX Garden capture trace: phase=combine_enqueue_done "
+                "ubatch=%s capturing=%s dispatch_handle_id=0x%x "
+                "combine_handle_id=0x%x live_dispatch_handles=%s",
+                ubatch_id,
+                torch.cuda.is_current_stream_capturing(),
+                id(dispatch_handle),
+                id(combine_handle),
+                sorted(self._dispatch_handles),
+            )
 
         recv_done = False
 
@@ -352,11 +433,32 @@ class PplxGardenPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             nonlocal recv_done
             if recv_done:
                 return
+            if _pplx_capture_trace_enabled():
+                logger.warning(
+                    "PPLX Garden capture trace: phase=combine_recv_start "
+                    "ubatch=%s capturing=%s dispatch_handle_id=0x%x "
+                    "combine_handle_id=0x%x",
+                    ubatch_id,
+                    torch.cuda.is_current_stream_capturing(),
+                    id(dispatch_handle),
+                    id(combine_handle),
+                )
             self._call_with_debug_state(
                 f"combine recv ubatch={ubatch_id}",
                 combine_handle.recv,
             )
             recv_done = True
             self._dispatch_handles.pop(ubatch_id, None)
+            if _pplx_capture_trace_enabled():
+                logger.warning(
+                    "PPLX Garden capture trace: phase=combine_recv_done "
+                    "ubatch=%s capturing=%s dispatch_handle_id=0x%x "
+                    "combine_handle_id=0x%x live_dispatch_handles=%s",
+                    ubatch_id,
+                    torch.cuda.is_current_stream_capturing(),
+                    id(dispatch_handle),
+                    id(combine_handle),
+                    sorted(self._dispatch_handles),
+                )
 
         return recv_combine, lambda: None
