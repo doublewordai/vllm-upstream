@@ -208,7 +208,14 @@ def _lazy_init() -> None:
 
     # Set up deep_gemm cache path
     DEEP_GEMM_JIT_CACHE_ENV_NAME = "DG_JIT_CACHE_DIR"
-    if not os.environ.get(DEEP_GEMM_JIT_CACHE_ENV_NAME, None):
+    if os.environ.get("DG_JIT_CACHE_PER_PID", "0") == "1":
+        dg_cache_base = os.environ.get(
+            "DG_JIT_CACHE_BASE", os.path.join(envs.VLLM_CACHE_ROOT, "deep_gemm")
+        )
+        os.environ[DEEP_GEMM_JIT_CACHE_ENV_NAME] = os.path.join(
+            dg_cache_base, f"pid_{os.getpid()}"
+        )
+    elif not os.environ.get(DEEP_GEMM_JIT_CACHE_ENV_NAME, None):
         os.environ[DEEP_GEMM_JIT_CACHE_ENV_NAME] = os.path.join(
             envs.VLLM_CACHE_ROOT, "deep_gemm"
         )
