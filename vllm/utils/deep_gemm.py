@@ -283,7 +283,14 @@ def cublaslt_gemm_nt(*args, **kwargs):
     return _cublaslt_gemm_nt_impl(*args, **kwargs)
 
 
+def _set_current_device_from_arg(args: tuple[Any, ...], index: int) -> None:
+    output = args[index] if len(args) > index else None
+    if torch.is_tensor(output) and output.is_cuda:
+        torch.cuda.set_device(output.device)
+
+
 def fp8_gemm_nt(*args, **kwargs):
+    _set_current_device_from_arg(args, 2)
     _lazy_init()
     if _fp8_gemm_nt_impl is None:
         return _missing(*args, **kwargs)
@@ -296,6 +303,7 @@ def fp8_gemm_nt(*args, **kwargs):
 
 
 def fp8_einsum(*args, **kwargs):
+    _set_current_device_from_arg(args, 3)
     _lazy_init()
     if _fp8_einsum_impl is None:
         return _missing(*args, **kwargs)
