@@ -254,6 +254,8 @@ def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
     Returns:
         Output tensor of shape (batch_size, output_dim) in bfloat16 format
     """
+    if input.is_cuda:
+        torch.cuda.set_device(input.device)
 
     def run_flashinfer_deepgemm_swapAB(
         input: torch.Tensor,
