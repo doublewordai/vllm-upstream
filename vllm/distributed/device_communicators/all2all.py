@@ -201,6 +201,8 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        # Isambard/UCCL diagnostic: keep HT buffers alive before live traffic.
+        self._eager_handle = self.get_handle({})
 
     def _make_all2all_kwargs(self) -> dict[Any, Any]:
         # Defaults for internode and intranode are taken from DeepEP tests.
