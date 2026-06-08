@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     S3_ENDPOINT_URL: str | None = None
     VLLM_MODEL_REDIRECT_PATH: str | None = None
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
+    VLLM_CACHE_ROOT_PER_PID: bool = False
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
     VLLM_NO_USAGE_STATS: bool = False
@@ -295,6 +296,18 @@ def get_default_config_root():
         "XDG_CONFIG_HOME",
         os.path.join(os.path.expanduser("~"), ".config"),
     )
+
+
+def get_vllm_cache_root():
+    cache_root = os.path.expanduser(
+        os.getenv(
+            "VLLM_CACHE_ROOT",
+            os.path.join(get_default_cache_root(), "vllm"),
+        )
+    )
+    if os.getenv("VLLM_CACHE_ROOT_PER_PID") == "1":
+        return os.path.join(cache_root, f"pid_{os.getpid()}")
+    return cache_root
 
 
 def maybe_convert_int(value: str | None) -> int | None:
@@ -651,12 +664,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
-    "VLLM_CACHE_ROOT": lambda: os.path.expanduser(
-        os.getenv(
-            "VLLM_CACHE_ROOT",
-            os.path.join(get_default_cache_root(), "vllm"),
-        )
-    ),
+    "VLLM_CACHE_ROOT": get_vllm_cache_root,
+    # If set, VLLM_CACHE_ROOT is scoped to this process ID.
+    "VLLM_CACHE_ROOT_PER_PID": lambda: os.getenv("VLLM_CACHE_ROOT_PER_PID") == "1",
     # used in distributed environment to determine the ip address
     # of the current node, when the node has multiple network interfaces.
     # If you are using multi-node inference, you should set this differently
