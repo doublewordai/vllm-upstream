@@ -51,6 +51,8 @@ def check_ubatch_thresholds(
 def _pad_out_ubatch_slices(
     ubatch_slices: UBatchSlices, num_total_tokens: int, num_reqs_padded: int
 ) -> UBatchSlices:
+    num_total_tokens = int(num_total_tokens)
+    num_reqs_padded = int(num_reqs_padded)
     last_slice = ubatch_slices[-1]
     padded_last_request_slice = slice(last_slice.request_slice.start, num_reqs_padded)
     padded_last_token_slice = slice(last_slice.token_slice.start, num_total_tokens)
@@ -71,10 +73,18 @@ def maybe_create_ubatch_slices(
     if not should_ubatch:
         return None, None
 
-    if split_point is None:
-        split_point = int(num_tokens_padded) // num_ubatches
+    num_tokens_padded = int(num_tokens_padded)
+    num_reqs_padded = int(num_reqs_padded)
+    num_ubatches = int(num_ubatches)
 
-    token_split_points = [split_point * i for i in range(1, num_ubatches)]
+    if split_point is None:
+        split_point = num_tokens_padded // num_ubatches
+
+    if isinstance(split_point, list):
+        token_split_points = [int(point) for point in split_point]
+    else:
+        split_point = int(split_point)
+        token_split_points = [split_point * i for i in range(1, num_ubatches)]
 
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)
@@ -85,9 +95,10 @@ def maybe_create_ubatch_slices(
     start_token = 0
 
     # Add the end point to the split points to make iteration easier
-    all_points = token_split_points + [cu_num_tokens[-1]]
+    all_points = token_split_points + [int(cu_num_tokens[-1])]
 
     for end_token in all_points:
+        end_token = int(end_token)
         token_slice = slice(start_token, end_token)
 
         # Determine request slices using exclusive stop semantics
@@ -103,7 +114,7 @@ def maybe_create_ubatch_slices(
         req_slice = slice(req_start, req_stop)
         ubatch_slices.append(UBatchSlice(req_slice, token_slice))
 
-        start_token = end_token
+        start_token = int(end_token)
 
     ubatch_slices_padded = _pad_out_ubatch_slices(
         ubatch_slices, num_tokens_padded, num_reqs_padded
@@ -218,8 +229,8 @@ def _make_metadata_with_slice(
     # the attention backend selects the correct kernel for SWA layers.
     max_seq_len = max(int(seq_lens_cpu_upper_bound.max()), attn_metadata.max_seq_len)
 
-    num_requests = request_slice.stop - request_slice.start
-    num_actual_tokens = token_slice.stop - token_slice.start
+    num_requests = int(request_slice.stop) - int(request_slice.start)
+    num_actual_tokens = int(token_slice.stop) - int(token_slice.start)
     max_query_len = int(
         torch.max(torch.abs(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])).item()
     )
