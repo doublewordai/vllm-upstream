@@ -30,6 +30,7 @@ from vllm.v1.worker.sm_control import (
     get_ubatch_comm_sms,
 )
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm.v1.worker.ubatch_utils import ensure_tensor_alignment
 
 logger = init_logger(__name__)
 
@@ -397,13 +398,18 @@ class UBatchWrapper:
         inputs_embeds,
         intermediate_tensors,
     ):
-        sliced_input_ids = input_ids[tokens_slice] if input_ids is not None else None
+        sliced_input_ids = (
+            ensure_tensor_alignment(input_ids[tokens_slice])
+            if input_ids is not None
+            else None
+        )
         # if we are using mrope. Mrope adds an additional dimension to the
         # positions tensor
         if positions.ndim == 2:
             sliced_positions = positions[:, tokens_slice]
         else:
             sliced_positions = positions[tokens_slice]
+        sliced_positions = ensure_tensor_alignment(sliced_positions)
         sliced_inputs_embeds = (
             inputs_embeds[tokens_slice] if inputs_embeds is not None else None
         )
