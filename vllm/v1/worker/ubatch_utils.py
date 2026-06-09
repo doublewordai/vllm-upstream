@@ -37,10 +37,13 @@ def ensure_tensor_alignment(
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
-def is_last_ubatch_empty(
+def has_empty_ubatch(
     orig_num_tokens: int, padded_num_tokens: int, num_ubatches: int
 ) -> bool:
-    return (padded_num_tokens // num_ubatches) * (num_ubatches - 1) >= orig_num_tokens
+    tokens_per_ubatch = padded_num_tokens // num_ubatches
+    if tokens_per_ubatch == 0:
+        return True
+    return tokens_per_ubatch * (num_ubatches - 1) >= orig_num_tokens
 
 
 def check_ubatch_thresholds(
@@ -107,6 +110,8 @@ def maybe_create_ubatch_slices(
 
     for end_token in all_points:
         end_token = int(end_token)
+        if end_token <= start_token:
+            return None, None
         token_slice = slice(start_token, end_token)
 
         # Determine request slices using exclusive stop semantics
