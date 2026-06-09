@@ -14,7 +14,6 @@ from vllm.utils.deep_gemm import (
     has_deep_gemm,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -28,6 +27,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.worker.sm_control import get_ubatch_compute_sms
 
 logger = init_logger(__name__)
 
@@ -281,8 +281,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             or not current_platform.is_device_capability_family(100)
         ) and next_n not in self.natively_supported_next_n_fp4
 
-        sm_count = num_compute_units(self.device.index)
-        self.num_sms = sm_count
+        self.num_sms = get_ubatch_compute_sms(self.vllm_config, self.device.index)
 
         self.offsets_buffer = torch.arange(
             next_n, device=self.device, dtype=torch.int32
