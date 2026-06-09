@@ -29,6 +29,14 @@ class UBatchSlice:
 UBatchSlices: TypeAlias = list[UBatchSlice]
 
 
+def ensure_tensor_alignment(
+    tensor: torch.Tensor, alignment: int = 64
+) -> torch.Tensor:
+    if tensor.is_contiguous() and tensor.data_ptr() % alignment == 0:
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
 def is_last_ubatch_empty(
     orig_num_tokens: int, padded_num_tokens: int, num_ubatches: int
 ) -> bool:
@@ -240,10 +248,12 @@ def _make_metadata_with_slice(
     if max_query_len == 0:
         max_query_len = attn_metadata.max_query_len
 
-    block_table_tensor = attn_metadata.block_table_tensor[request_slice]
-    slot_mapping = attn_metadata.slot_mapping[token_slice]
+    block_table_tensor = ensure_tensor_alignment(
+        attn_metadata.block_table_tensor[request_slice]
+    )
+    slot_mapping = ensure_tensor_alignment(attn_metadata.slot_mapping[token_slice])
     positions = (
-        attn_metadata.positions[token_slice]
+        ensure_tensor_alignment(attn_metadata.positions[token_slice])
         if attn_metadata.positions is not None
         else None
     )
