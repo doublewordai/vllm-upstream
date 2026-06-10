@@ -1185,11 +1185,35 @@ class CompilationConfig:
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
+        # With worst-token dispatch (UCCL ht-cudagraph-worst-tokens kernels),
+        # DeepEP HT dispatch+combine are stream-capturable: no host count
+        # sync, static worst-case recv shapes, device-side per-expert counts.
+        # Capture decode steps fully; prefill stays eager.
+        if (
+            all2all_backend == "deepep_high_throughput"
+            and data_parallel_size > 1
+            and self.cudagraph_mode != CUDAGraphMode.NONE
+            and envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH
+        ):
+            if self.cudagraph_mode.has_full_cudagraphs():
+                logger.info(
+                    "DeepEP high-throughput worst-token dispatch enabled; "
+                    "capturing full decode CUDA graphs."
+                )
+                self.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            else:
+                logger.warning_once(
+                    "VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH requires full decode "
+                    "CUDA graphs; setting cudagraph_mode to NONE."
+                )
+                self.cudagraph_mode = CUDAGraphMode.NONE
+
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
         if (
             all2all_backend == "deepep_high_throughput"
             and data_parallel_size > 1
             and self.cudagraph_mode != CUDAGraphMode.NONE
+            and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH
         ):
             # TODO: Piecewise Cuda graph might be enabled
             # if torch compile cache key issue fixed
