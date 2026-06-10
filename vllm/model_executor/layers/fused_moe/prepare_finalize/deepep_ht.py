@@ -88,7 +88,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             pass
         return "no-forward-context"
 
-    def _num_worst_tokens(self) -> int:
+    def _num_worst_tokens(self, tokens: torch.Tensor) -> int:
         """Worst-case recv size for CUDA-graph-safe dispatch.
 
         When non-zero, dispatch skips its host count sync, returns
@@ -97,10 +97,14 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         stream-capturable (requires the UCCL ht-cudagraph-worst-tokens
         kernels).
 
-        Sized to the current step's padded token count so each captured
-        decode shape gets right-sized static buffers. Eager steps (prefill,
-        mixed, uncaptured shapes) return 0 and keep the host-synced path —
-        no padding overhead where there is no graph to serve."""
+        Sized from the dispatched tensor itself: DP padding makes its row
+        count uniform across ranks, so it equals the step's padded token
+        count for whole-batch steps and this microbatch's padded slice
+        under DBO ubatching (the forward context's batch descriptor covers
+        the whole step there, which would oversize ubatch recv buffers 2x).
+        Eager steps (prefill, mixed, uncaptured shapes) return 0 and keep
+        the host-synced path — no padding overhead where there is no graph
+        to serve."""
         if not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH:
             return 0
         if not is_forward_context_available():
@@ -108,12 +112,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         ctx = get_forward_context()
         if ctx.cudagraph_runtime_mode != CUDAGraphMode.FULL:
             return 0
-        num_tokens = (
-            ctx.batch_descriptor.num_tokens
-            if ctx.batch_descriptor is not None
-            else self.max_tokens_per_rank
-        )
-        return num_tokens * self.num_dispatchers_
+        return tokens.size(0) * self.num_dispatchers_
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -183,7 +182,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
-        num_worst_tokens = self._num_worst_tokens()
+        num_worst_tokens = self._num_worst_tokens(tokens)
         try:
             (
                 token_data,
