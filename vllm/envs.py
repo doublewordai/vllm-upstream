@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_DBO_BREAKABLE_CUDAGRAPH: bool = True
+    VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH: bool = False
     VLLM_DBO_DEBUG_LOGGING: bool = False
     VLLM_DP_START_WAVE_COALESCE_MS: int = 0
     VLLM_DP_MASTER_IP: str = ""
@@ -730,6 +731,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DBO_DEBUG_LOGGING": lambda: bool(
         int(os.getenv("VLLM_DBO_DEBUG_LOGGING", "0"))
+    ),
+    # Experimental: DeepEP high-throughput dispatch with worst-case-sized
+    # recv buffers and no host count sync (CUDA-graph capturable; requires
+    # the UCCL ht-cudagraph-worst-tokens kernels).
+    "VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH": lambda: (
+        os.environ.get("VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH", "0") == "1"
     ),
     "VLLM_DP_START_WAVE_COALESCE_MS": lambda: int(
         os.getenv("VLLM_DP_START_WAVE_COALESCE_MS") or "0"
