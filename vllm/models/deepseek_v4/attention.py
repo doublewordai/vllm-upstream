@@ -432,6 +432,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # on the default stream so q stays on its consumer stream (mla_attn
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
+        post_gemm_overlap_enabled = (
+            hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        )
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
@@ -464,7 +467,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=aux_streams is not None and post_gemm_overlap_enabled,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -484,6 +487,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                enable=post_gemm_overlap_enabled,
             )
         else:
             # SWA-only layer: no compressor, no overlap.
@@ -906,5 +910,6 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            enable=positions.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
