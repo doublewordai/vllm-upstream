@@ -23,6 +23,7 @@ def maybe_execute_in_parallel(
     event0: torch.cuda.Event,
     event1: torch.cuda.Event,
     aux_stream: torch.cuda.Stream | None = None,
+    enable: bool = True,
 ) -> tuple[Any, Any]:
     """Run two functions potentially in parallel on separate CUDA streams.
 
@@ -40,11 +41,13 @@ def maybe_execute_in_parallel(
         event1: CUDA event recorded after fn1 so default stream can wait.
         aux_stream: The second CUDA stream for fn1.
             Multi-stream is disabled when aux_stream is None.
+        enable: Opt-in switch for the multi-stream path. When False, both
+            functions execute sequentially on the current stream.
 
     Returns:
         Tuple of (fn0_result, fn1_result).
     """
-    if aux_stream is not None:
+    if aux_stream is not None and enable:
         event0.record()
         result0 = fn0()
         with torch.cuda.stream(aux_stream):
