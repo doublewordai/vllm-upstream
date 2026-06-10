@@ -76,6 +76,18 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
 
+    def _step_debug(self) -> str:
+        try:
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                return (
+                    f"mode={ctx.cudagraph_runtime_mode} "
+                    f"descriptor={ctx.batch_descriptor}"
+                )
+        except Exception:
+            pass
+        return "no-forward-context"
+
     def _num_worst_tokens(self) -> int:
         """Worst-case recv size for CUDA-graph-safe dispatch.
 
@@ -171,15 +183,17 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
-        (
-            token_data,
-            expert_topk_ids,
-            expert_topk_weights,
-            expert_num_tokens_per_expert_list,
-            handle,
-            event,
-        ) = self.buffer.dispatch(
-            x=token_data,
+        num_worst_tokens = self._num_worst_tokens()
+        try:
+            (
+                token_data,
+                expert_topk_ids,
+                expert_topk_weights,
+                expert_num_tokens_per_expert_list,
+                handle,
+                event,
+            ) = self.buffer.dispatch(
+                x=token_data,
             handle=None,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -189,22 +203,28 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             topk_weights=rank_topk_weights,
             # expert_alignment rounds the number of tokens per expert
             # to this value.
-            expert_alignment=1,
-            num_worst_tokens=(num_worst_tokens := self._num_worst_tokens()),
-            config=self._get_dispatch_config(),
-            previous_event=previous_event,
-            # With worst-token graphs in play, ALL dispatches must join back
-            # to the compute stream: a graph replay launched on the compute
-            # stream does not wait on the live comm stream, so an async eager
-            # dispatch still in flight would race the captured dispatch
-            # kernels on the shared ring buffers.
-            async_finish=(
-                self.async_prepare
-                and not dbo_enabled()
-                and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH
-            ),
-            allocate_on_comm_stream=False,
-        )
+                expert_alignment=1,
+                num_worst_tokens=num_worst_tokens,
+                config=self._get_dispatch_config(),
+                previous_event=previous_event,
+                # With worst-token graphs in play, ALL dispatches must join
+                # back to the compute stream: a graph replay launched on the
+                # compute stream does not wait on the live comm stream, so an
+                # async eager dispatch still in flight would race the captured
+                # dispatch kernels on the shared ring buffers.
+                async_finish=(
+                    self.async_prepare
+                    and not dbo_enabled()
+                    and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH
+                ),
+                allocate_on_comm_stream=False,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc} [deepep-ht dispatch debug: "
+                f"tokens={tokens.shape[0]} worst={num_worst_tokens} "
+                f"{self._step_debug()}]"
+            ) from exc
 
         # record the handle for this ubatch
         a2a_idx = dbo_current_ubatch_id()
@@ -418,7 +438,8 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
-        combined_x, _, event = self.buffer.combine(
+        try:
+            combined_x, _, event = self.buffer.combine(
             # HT combine only supports BF16
             x=fused_expert_output,
             handle=handle,
@@ -431,7 +452,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             and not dbo_enabled()
             and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH,
             allocate_on_comm_stream=False,
-        )
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc} [deepep-ht combine debug: "
+                f"tokens={fused_expert_output.shape[0]} {self._step_debug()}]"
+            ) from exc
 
         dbo_switch_to_compute()
 
