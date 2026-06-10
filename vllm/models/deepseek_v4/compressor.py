@@ -106,10 +106,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
     ) -> CompressorMetadata:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        assert x.shape[0] <= num_tokens
+        self.token_to_req_indices[:num_tokens].fill_(0)
+        self.token_to_req_indices[: x.shape[0]].copy_(x, non_blocking=True)
+        token_to_req_indices = self.token_to_req_indices[:num_tokens]
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
