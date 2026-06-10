@@ -151,6 +151,9 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    VLLM_DBO_BREAKABLE_CUDAGRAPH: bool = True
+    VLLM_DBO_DEBUG_LOGGING: bool = False
+    VLLM_DP_START_WAVE_COALESCE_MS: int = 0
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -260,6 +263,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+    VLLM_DEEPSEEK_V4_KV_INSERT_DEBUG: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -718,6 +722,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # Experimental: allow DBO ubatch replay to use breakable CUDA graphs
+    # around eager MoE/communication regions.
+    "VLLM_DBO_BREAKABLE_CUDAGRAPH": lambda: (
+        os.environ.get("VLLM_DBO_BREAKABLE_CUDAGRAPH", "1") == "1"
+    ),
+    "VLLM_DBO_DEBUG_LOGGING": lambda: bool(
+        int(os.getenv("VLLM_DBO_DEBUG_LOGGING", "0"))
+    ),
+    "VLLM_DP_START_WAVE_COALESCE_MS": lambda: int(
+        os.getenv("VLLM_DP_START_WAVE_COALESCE_MS") or "0"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
@@ -1883,6 +1898,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for the default value of 1024 tokens.
     "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: int(
         os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
+    ),
+    "VLLM_DEEPSEEK_V4_KV_INSERT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_KV_INSERT_DEBUG", "0"))
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file

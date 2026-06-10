@@ -814,6 +814,7 @@ class GPUModelRunner(
         )
 
         self.reorder_batch_threshold: int | None = None
+        self.dbo_runtime_decision_log_count = 0
 
         # Attention layers that are only in the KVCacheConfig of the runner
         # (e.g., KV sharing, encoder-only attention), but not in the
@@ -4074,6 +4075,30 @@ class GPUModelRunner(
                 should_ubatch,
                 num_tokens_across_dp,
             )
+            if (
+                envs.VLLM_DBO_DEBUG_LOGGING
+                and self._uses_dbo_breakable_cudagraphs()
+                and self.dbo_runtime_decision_log_count < 128
+            ):
+                logger.info(
+                    "DBO runtime batch decision: tokens=%d reqs=%d "
+                    "max_scheduled_tokens=%d uniform_decode=%s "
+                    "cudagraph_mode=%s batch_descriptor=%s should_ubatch=%s "
+                    "num_tokens_across_dp=%s",
+                    num_tokens_unpadded,
+                    num_reqs,
+                    max_num_scheduled_tokens,
+                    bool(max_num_scheduled_tokens == self.uniform_decode_query_len),
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    (
+                        num_tokens_across_dp.detach().cpu().tolist()
+                        if num_tokens_across_dp is not None
+                        else None
+                    ),
+                )
+                self.dbo_runtime_decision_log_count += 1
 
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = (
@@ -5603,6 +5628,29 @@ class GPUModelRunner(
         # for GQA/MQA.
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
+        padded_decode_tokens_to_schedule = num_tokens - max_query_len
+        use_padded_decode_capture_shape = (
+            is_graph_capturing
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and uniform_decode
+            and allow_microbatching
+            and self._uses_dbo_breakable_cudagraphs()
+            and padded_decode_tokens_to_schedule > 0
+            and check_ubatch_thresholds(
+                self.parallel_config,
+                num_tokens,
+                uniform_decode=True,
+            )
+            and check_ubatch_thresholds(
+                self.parallel_config,
+                padded_decode_tokens_to_schedule,
+                uniform_decode=True,
+            )
+        )
+        num_tokens_to_schedule = (
+            num_tokens - max_query_len if use_padded_decode_capture_shape else num_tokens
+        )
+
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
@@ -5612,8 +5660,8 @@ class GPUModelRunner(
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
-            num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
-            num_prefill_tokens = num_tokens - num_decode_tokens
+            num_decode_tokens = min(max_num_reqs - 1, num_tokens_to_schedule // 2)
+            num_prefill_tokens = num_tokens_to_schedule - num_decode_tokens
             num_reqs = num_decode_tokens + 1
 
             # Create decode requests (1 token each) followed by prefill request
@@ -5622,22 +5670,29 @@ class GPUModelRunner(
             max_query_len = num_prefill_tokens
         elif uniform_decode:
             assert not create_mixed_batch
-            num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
+            num_reqs = min(max_num_reqs, cdiv(num_tokens_to_schedule, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
-            if num_tokens % max_query_len != 0:
-                num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+            if num_tokens_to_schedule % max_query_len != 0:
+                num_scheduled_tokens_list[-1] = num_tokens_to_schedule % max_query_len
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
+            num_reqs = min(num_tokens_to_schedule, max_num_reqs)
+            min_tokens_per_req = num_tokens_to_schedule // num_reqs
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            num_scheduled_tokens_list[-1] += num_tokens_to_schedule % num_reqs
 
-        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert sum(num_scheduled_tokens_list) == num_tokens_to_schedule
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        sync_runtime_dummy_decode_before_eplb = (
+            self._uses_dbo_breakable_cudagraphs()
+            and not is_graph_capturing
+            and uniform_decode
+            and num_tokens == self.uniform_decode_query_len
+            and not is_profile
+        )
 
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
@@ -5676,6 +5731,35 @@ class GPUModelRunner(
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
+        if (
+            envs.VLLM_DBO_DEBUG_LOGGING
+            and is_graph_capturing
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and uniform_decode
+            and self._uses_dbo_breakable_cudagraphs()
+        ):
+            logger.info(
+                "DBO decode CUDA graph dummy shape: target_tokens=%d "
+                "scheduled_tokens=%d target_reqs=%d scheduled_reqs=%d "
+                "use_padded_request=%s should_ubatch=%s batch_descriptor=%s",
+                num_tokens,
+                num_tokens_unpadded,
+                num_reqs_padded,
+                num_reqs,
+                use_padded_decode_capture_shape,
+                should_ubatch,
+                batch_desc,
+            )
+        if use_padded_decode_capture_shape:
+            logger.info(
+                "Using padded-request DBO decode capture shape: "
+                "target_tokens=%d scheduled_tokens=%d target_reqs=%d "
+                "scheduled_reqs=%d",
+                num_tokens,
+                num_tokens_unpadded,
+                num_reqs_padded,
+                num_reqs,
+            )
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
             num_scheduled_tokens,
@@ -5731,7 +5815,11 @@ class GPUModelRunner(
                 cum_num_tokens = self._get_cumsum_and_arange(
                     num_scheduled_tokens, self.query_pos.np
                 )
+                self.query_start_loc.np[0] = 0
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
+                    cum_num_tokens[-1]
+                )
                 self.query_start_loc.copy_to_gpu()
 
                 # Sync block table CPU->GPU so cleared rows from
@@ -5744,7 +5832,8 @@ class GPUModelRunner(
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=is_graph_capturing,
@@ -5898,6 +5987,22 @@ class GPUModelRunner(
         # In such cases, we still have to trigger EPLB to make sure
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
+            # Runtime DP dummy batches do not do the output/bookkeeping sync that
+            # real batches do before EPLB. DeepEP high-throughput DBO can still
+            # have work pending on non-default streams, so synchronize before
+            # entering EPLB's collective state update.
+            if sync_runtime_dummy_decode_before_eplb:
+                if envs.VLLM_DBO_DEBUG_LOGGING:
+                    logger.info(
+                        "Synchronizing DeepEP high-throughput DBO runtime "
+                        "dummy decode before EPLB: num_tokens_across_dp=%s",
+                        (
+                            num_tokens_across_dp.detach().cpu().tolist()
+                            if num_tokens_across_dp is not None
+                            else None
+                        ),
+                    )
+                self._sync_device()
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
@@ -5905,6 +6010,67 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
         return hidden_states, hidden_states[logit_indices_device]
+
+    def _uses_dbo_breakable_cudagraphs(self) -> bool:
+        return (
+            self.parallel_config.use_ubatching
+            and self.parallel_config.all2all_backend == "deepep_high_throughput"
+            and self.parallel_config.data_parallel_size > 1
+            and envs.VLLM_DBO_BREAKABLE_CUDAGRAPH
+        )
+
+    def _reserve_deepep_ht_moe_workspace(self) -> None:
+        """Reserve MoE workspace for worst-case DeepEP HT routed-token counts."""
+        num_ubatches = (
+            self.parallel_config.num_ubatches
+            if self.parallel_config.use_ubatching
+            else 1
+        )
+        num_reserved_layers = 0
+        largest_reservation = 0
+        model = self.get_model()
+
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            moe_kernel = getattr(quant_method, "moe_kernel", None)
+            moe_config = getattr(module, "moe_config", None)
+            if moe_kernel is None or moe_config is None:
+                continue
+            if not all(
+                hasattr(module, attr)
+                for attr in (
+                    "w13_weight",
+                    "w2_weight",
+                    "top_k",
+                    "activation",
+                    "global_num_experts",
+                    "local_num_experts",
+                )
+            ):
+                continue
+
+            reserved_bytes = moe_kernel.reserve_max_workspace(
+                out_dtype=moe_config.in_dtype,
+                device=self.device,
+                w1=module.w13_weight,
+                w2=module.w2_weight,
+                top_k=module.top_k,
+                activation=module.activation,
+                global_num_experts=module.global_num_experts,
+                local_num_experts=module.local_num_experts,
+                num_ubatches=num_ubatches,
+            )
+            if reserved_bytes:
+                num_reserved_layers += 1
+                largest_reservation = max(largest_reservation, reserved_bytes)
+
+        if num_reserved_layers:
+            logger.info(
+                "Reserved max DeepEP high-throughput MoE workspace for %d "
+                "layers; largest reservation %.2f MB",
+                num_reserved_layers,
+                largest_reservation / (1024**2),
+            )
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -6160,9 +6326,22 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        profile_allow_microbatching = not self._uses_dbo_breakable_cudagraphs()
+        if not profile_allow_microbatching:
+            logger.info(
+                "Running DeepEP high-throughput DBO memory profile without "
+                "microbatching; max routed-token workspace is reserved "
+                "explicitly before KV cache sizing."
+            )
+
+        # Add `is_profile` here to pre-allocate communication buffers.
+        # DeepEP high-throughput DBO uses two concurrent dispatches in live
+        # decode, but the startup memory profile only needs one deterministic
+        # dispatch plus explicit per-ubatch workspace reservation below.
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            is_profile=True,
+            allow_microbatching=profile_allow_microbatching,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -6172,6 +6351,8 @@ class GPUModelRunner(
         else:
             output = None
         self._sync_device()
+        if self._uses_dbo_breakable_cudagraphs():
+            self._reserve_deepep_ht_moe_workspace()
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
@@ -6284,67 +6465,103 @@ class GPUModelRunner(
                 if descs
             ),
         )
+        exact_profile = self._uses_dbo_breakable_cudagraphs()
 
         # Use a temporary pool for profiling to avoid fragmentation in the main pool.
         profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
-        all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-            BreakableCUDAGraphWrapper._all_instances
+        ubatch_wrappers = [self.model] if isinstance(self.model, UBatchWrapper) else []
+        all_wrappers = (
+            list(CUDAGraphWrapper._all_instances)
+            + list(BreakableCUDAGraphWrapper._all_instances)
+            + ubatch_wrappers
         )
         for instance in all_wrappers:
             original_pools[id(instance)] = instance.graph_pool
             instance.graph_pool = profiling_pool
 
         set_cudagraph_capturing_enabled(True)
+        total_estimate = 0
+        profile_start_free_gpu_memory: int | None = None
         with self._freeze_gc(), graph_capture(device=self.device):
-            shared_memory_estimate = {}
-            per_graph_estimate = {}
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
 
-            for mode, descs in capture_descs:
-                profile_descs = descs[:2]
-                mem_samples: list[int] = []
-
-                for i, desc in enumerate(profile_descs):
-                    mem_before = torch.cuda.mem_get_info()[0]
-                    self._warmup_and_capture(
-                        desc,
+            if exact_profile:
+                profile_start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+                for mode, descs in capture_descs:
+                    self._capture_cudagraphs(
+                        batch_descriptors=descs,
                         cudagraph_runtime_mode=mode,
-                        profile_seq_lens=(
-                            min(
-                                self.max_model_len,
-                                self.max_num_tokens // desc.num_tokens,
-                            )
-                            if mode == CUDAGraphMode.FULL and i == 0
-                            else None
-                        ),
                     )
                     torch.accelerator.synchronize()
-                    free_after = torch.cuda.mem_get_info()[0]
-                    mem_samples.append(mem_before - free_after)
+                end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+                total_estimate = profile_start_free_gpu_memory - end_free_gpu_memory
+                logger.info(
+                    "Estimated CUDA graph memory by exact DBO profiling: "
+                    "%.2f GiB",
+                    total_estimate / (1 << 30),
+                )
+            else:
+                shared_memory_estimate = {}
+                per_graph_estimate = {}
 
-                first_capture = mem_samples[0]
-                # Use at least 1 MiB per graph for driver overhead
-                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+                for mode, descs in capture_descs:
+                    profile_descs = descs[:2]
+                    mem_samples: list[int] = []
 
-                shared_memory_estimate[mode] = first_capture
-                per_graph_estimate[mode] = per_graph * (len(descs) - 1)
+                    for i, desc in enumerate(profile_descs):
+                        mem_before = torch.cuda.mem_get_info()[0]
+                        self._warmup_and_capture(
+                            desc,
+                            cudagraph_runtime_mode=mode,
+                            profile_seq_lens=(
+                                min(
+                                    self.max_model_len,
+                                    self.max_num_tokens // desc.num_tokens,
+                                )
+                                if mode == CUDAGraphMode.FULL and i == 0
+                                else None
+                            ),
+                        )
+                        torch.accelerator.synchronize()
+                        free_after = torch.cuda.mem_get_info()[0]
+                        mem_samples.append(mem_before - free_after)
 
-                logger.debug(
-                    "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
-                    mode.name,
-                    first_capture / (1 << 20),
-                    len(descs),
-                    per_graph / (1 << 20),
+                    first_capture = mem_samples[0]
+                    # Use at least 1 MiB per graph for driver overhead
+                    per_graph = max(
+                        mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20
+                    )
+
+                    shared_memory_estimate[mode] = first_capture
+                    per_graph_estimate[mode] = per_graph * (len(descs) - 1)
+
+                    logger.debug(
+                        "Estimated %s CUDA graph memory: "
+                        "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
+                        mode.name,
+                        first_capture / (1 << 20),
+                        len(descs),
+                        per_graph / (1 << 20),
+                    )
+
+                # FULL and PIECEWISE graphs share the global pool at runtime and are
+                # never replayed concurrently, so the pool overlays their memory.
+                # Take the max to avoid double-counting the overlap.
+                total_estimate = max(shared_memory_estimate.values()) + sum(
+                    per_graph_estimate.values()
                 )
 
         set_cudagraph_capturing_enabled(False)
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
-        all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-            BreakableCUDAGraphWrapper._all_instances
+        for instance in ubatch_wrappers:
+            instance.clear_graphs()
+        all_wrappers = (
+            list(CUDAGraphWrapper._all_instances)
+            + list(BreakableCUDAGraphWrapper._all_instances)
+            + ubatch_wrappers
         )
         for instance in all_wrappers:
             if id(instance) in original_pools:
@@ -6355,17 +6572,30 @@ class GPUModelRunner(
         self.maybe_remove_all_loras(self.lora_config)
         self._cleanup_profiling_kv_cache()
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+        if exact_profile and profile_start_free_gpu_memory is not None:
+            free_after_cleanup = torch.cuda.mem_get_info()[0]
+            resident_profile_memory = max(
+                profile_start_free_gpu_memory - free_after_cleanup, 0
+            )
+            if resident_profile_memory > 0:
+                total_estimate = max(total_estimate - resident_profile_memory, 0)
+                logger.info(
+                    "DBO CUDA graph profiling left %.2f GiB resident; "
+                    "reserving %.2f GiB additional graph memory.",
+                    resident_profile_memory / (1 << 30),
+                    total_estimate / (1 << 30),
+                )
 
-        # FULL and PIECEWISE graphs share the global pool at runtime and are
-        # never replayed concurrently, so the pool overlays their memory.
-        # Take the max to avoid double-counting the overlap.
-        total_estimate = max(shared_memory_estimate.values()) + sum(
-            per_graph_estimate.values()
-        )
-        logger.info(
-            "Estimated CUDA graph memory: %.2f GiB total",
-            total_estimate / (1 << 30),
-        )
+        if exact_profile:
+            logger.info(
+                "Estimated CUDA graph memory to reserve: %.2f GiB",
+                total_estimate / (1 << 30),
+            )
+        else:
+            logger.info(
+                "Estimated CUDA graph memory: %.2f GiB total",
+                total_estimate / (1 << 30),
+            )
 
         return int(total_estimate)
 
@@ -6537,10 +6767,34 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                 )
             )
+            if (
+                self._uses_dbo_breakable_cudagraphs()
+                and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and uniform_decode
+                and not allow_microbatching
+            ):
+                logger.info_once(
+                    "Skipping CUDA graph capture for DeepEP high-throughput "
+                    "DBO decode shapes below the effective DBO threshold; "
+                    "those shapes will run eager."
+                )
+                continue
+            num_warmups = None
+            if allow_microbatching and self._uses_dbo_breakable_cudagraphs():
+                # Breakable DBO graphs intentionally leave DeepEP/MoE as eager
+                # segments. A pre-capture eager DBO pass only exercises the
+                # distributed dispatch path during startup; it does not make the
+                # captured attention segments safer.
+                logger.info_once(
+                    "Skipping eager DBO CUDA graph warmups; DeepEP/MoE will "
+                    "run as eager breakpoints during capture and replay."
+                )
+                num_warmups = 0
             self._warmup_and_capture(
                 batch_desc,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
+                num_warmups=num_warmups,
             )
             torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)

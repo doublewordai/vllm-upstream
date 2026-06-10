@@ -14,7 +14,10 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
@@ -74,6 +77,11 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _breakable_cudagraph_capture_active() -> bool:
+    capture = BreakableCUDAGraphCapture.current()
+    return capture is not None and capture._capturing
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -432,6 +440,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # on the default stream so q stays on its consumer stream (mla_attn
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
+        post_gemm_overlap_enabled = (
+            hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        )
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
@@ -464,7 +475,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=aux_streams is not None and post_gemm_overlap_enabled,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -484,6 +495,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                enable=post_gemm_overlap_enabled,
             )
         else:
             # SWA-only layer: no compressor, no overlap.
@@ -493,6 +505,93 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.mla_attn(q, kv, positions, output=out)
+
+    def _debug_validate_kv_insert_metadata(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        swa_kv_cache: torch.Tensor,
+    ) -> None:
+        slot_mapping = swa_metadata.slot_mapping
+        num_tokens = int(q.shape[0])
+        slot_capacity = int(swa_kv_cache.shape[0]) * int(swa_metadata.block_size)
+        cos_sin_rows = int(self.rotary_emb.cos_sin_cache.shape[0])
+
+        has_slots = slot_mapping.numel() > 0
+        has_positions = positions.numel() > 0
+        slot_min = int(slot_mapping.min().item()) if has_slots else -1
+        valid_slot_mapping = slot_mapping[slot_mapping >= 0]
+        if valid_slot_mapping.numel() > 0:
+            valid_slot_min = int(valid_slot_mapping.min().item())
+            valid_slot_max = int(valid_slot_mapping.max().item())
+        else:
+            valid_slot_min = -1
+            valid_slot_max = -1
+        pos_min = int(positions.min().item()) if has_positions else -1
+        pos_max = int(positions.max().item()) if has_positions else -1
+
+        shape_invalid = (
+            int(kv.shape[0]) != num_tokens
+            or int(slot_mapping.numel()) != num_tokens
+            or int(positions.numel()) != num_tokens
+        )
+        slot_invalid = slot_min < -1 or valid_slot_max >= slot_capacity
+        pos_invalid = pos_min < 0 or pos_max >= cos_sin_rows
+        invalid = shape_invalid or slot_invalid or pos_invalid
+
+        should_log = (
+            invalid
+            or (
+                num_tokens >= 1024
+                and not getattr(self, "_kv_insert_debug_logged", False)
+            )
+        )
+        if should_log:
+            log = logger.warning if invalid else logger.info
+            log(
+                "DeepSeek-V4 KV insert debug: layer=%s q_shape=%s kv_shape=%s "
+                "positions_shape=%s pos_range=[%d,%d] cos_sin_rows=%d "
+                "slot_shape=%s slot_range=[%d,%d] valid_slot_range=[%d,%d] "
+                "slot_capacity=%d block_size=%d num_decodes=%d "
+                "num_prefills=%d num_decode_tokens=%d num_prefill_tokens=%d "
+                "shape_invalid=%s slot_invalid=%s pos_invalid=%s",
+                self.prefix,
+                tuple(q.shape),
+                tuple(kv.shape),
+                tuple(positions.shape),
+                pos_min,
+                pos_max,
+                cos_sin_rows,
+                tuple(slot_mapping.shape),
+                slot_min,
+                valid_slot_max,
+                valid_slot_min,
+                valid_slot_max,
+                slot_capacity,
+                int(swa_metadata.block_size),
+                int(swa_metadata.num_decodes),
+                int(swa_metadata.num_prefills),
+                int(swa_metadata.num_decode_tokens),
+                int(swa_metadata.num_prefill_tokens),
+                shape_invalid,
+                slot_invalid,
+                pos_invalid,
+            )
+            self._kv_insert_debug_logged = True
+
+        if invalid:
+            raise RuntimeError(
+                "DeepSeek-V4 KV insert metadata is invalid before fused kernel: "
+                f"layer={self.prefix} q_shape={tuple(q.shape)} "
+                f"kv_shape={tuple(kv.shape)} "
+                f"positions_shape={tuple(positions.shape)} "
+                f"slot_shape={tuple(slot_mapping.shape)} "
+                f"pos_range=[{pos_min},{pos_max}] cos_sin_rows={cos_sin_rows} "
+                f"slot_range=[{slot_min},{valid_slot_max}] "
+                f"slot_capacity={slot_capacity}"
+            )
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -522,6 +621,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        if (
+            envs.VLLM_DEEPSEEK_V4_KV_INSERT_DEBUG
+            and not _breakable_cudagraph_capture_active()
+        ):
+            self._debug_validate_kv_insert_metadata(
+                q,
+                kv,
+                positions,
+                swa_metadata,
+                swa_kv_cache,
+            )
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE,
@@ -906,5 +1016,6 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            enable=positions.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)

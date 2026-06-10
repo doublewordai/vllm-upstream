@@ -28,6 +28,11 @@ class UBatchSlice:
 
 UBatchSlices: TypeAlias = list[UBatchSlice]
 
+# The DeepEP high-throughput DBO graph path uses DeepGEMM/communication-SM
+# scheduling that is not valid for the tiny decode shapes below this point.
+_DEEPEP_HT_DBO_MIN_DECODE_TOKENS = 64
+
+
 
 def ensure_tensor_alignment(
     tensor: torch.Tensor, alignment: int = 64
@@ -52,7 +57,10 @@ def check_ubatch_thresholds(
     if not config.use_ubatching:
         return False
     if uniform_decode:
-        return num_tokens >= config.dbo_decode_token_threshold
+        threshold = config.dbo_decode_token_threshold
+        if config.all2all_backend == "deepep_high_throughput":
+            threshold = max(threshold, _DEEPEP_HT_DBO_MIN_DECODE_TOKENS)
+        return num_tokens >= threshold
     else:
         return num_tokens >= config.dbo_prefill_token_threshold
 

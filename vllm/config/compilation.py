@@ -1097,7 +1097,10 @@ class CompilationConfig:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str, data_parallel_size: int = 1
+        self,
+        all2all_backend: str,
+        data_parallel_size: int = 1,
+        use_ubatching: bool = False,
     ):
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
@@ -1185,11 +1188,36 @@ class CompilationConfig:
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
+        dbo_breakable_cudagraph = (
+            envs.VLLM_DBO_BREAKABLE_CUDAGRAPH and use_ubatching
+        )
+
+        # DBO breakable CUDA graphs only capture decode compute segments and
+        # leave DeepEP high-throughput MoE work eager.
+        if (
+            all2all_backend == "deepep_high_throughput"
+            and data_parallel_size > 1
+            and self.cudagraph_mode != CUDAGraphMode.NONE
+            and dbo_breakable_cudagraph
+        ):
+            assert self.splitting_ops is not None
+            if "vllm::deepseek_v4_ffn" not in self.splitting_ops:
+                self.splitting_ops.append("vllm::deepseek_v4_ffn")
+            if self.cudagraph_mode.has_full_cudagraphs():
+                self.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            else:
+                logger.warning_once(
+                    "VLLM_DBO_BREAKABLE_CUDAGRAPH requires decode CUDA graphs; "
+                    "setting cudagraph_mode to NONE."
+                )
+                self.cudagraph_mode = CUDAGraphMode.NONE
+
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
         if (
             all2all_backend == "deepep_high_throughput"
             and data_parallel_size > 1
             and self.cudagraph_mode != CUDAGraphMode.NONE
+            and not dbo_breakable_cudagraph
         ):
             # TODO: Piecewise Cuda graph might be enabled
             # if torch compile cache key issue fixed

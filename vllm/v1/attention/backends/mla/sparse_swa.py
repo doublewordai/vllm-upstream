@@ -288,10 +288,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
+        num_tokens = common_attn_metadata.num_actual_tokens
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        assert x.shape[0] <= num_tokens
+        self.token_to_req_indices[:num_tokens].fill_(0)
+        self.token_to_req_indices[: x.shape[0]].copy_(x, non_blocking=True)
+        token_to_req_indices = self.token_to_req_indices[:num_tokens]
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)

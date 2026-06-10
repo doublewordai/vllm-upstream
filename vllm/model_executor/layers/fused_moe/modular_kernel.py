@@ -39,7 +39,10 @@ from vllm.v1.worker.ubatching import (
     dbo_register_recv_hook,
     dbo_yield,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    reserve_workspace_simultaneous,
+)
 
 logger = init_logger(__name__)
 
@@ -1092,14 +1095,114 @@ class FusedMoEKernelModularImpl:
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
         max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
+        try:
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+        except AssertionError as exc:
+            raise AssertionError(
+                f"{exc} MoE workspace request: M_chunk={M_chunk} "
+                f"M_full={M_full} N={N} K={K} top_k={top_k} "
+                f"global_experts={global_num_experts} "
+                f"local_experts={local_num_experts} "
+                f"workspace13_shape={workspace13_shape} "
+                f"workspace2_shape={workspace2_shape} "
+                f"fused_out_shape={fused_out_shape}."
+            ) from exc
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
         fused_out = _resize_cache(common_workspace, fused_out_shape)
 
         return workspace13, workspace2, fused_out
+
+    def reserve_max_workspace(
+        self,
+        out_dtype: torch.dtype,
+        device: torch.device,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        top_k: int,
+        activation: MoEActivation,
+        global_num_experts: int,
+        local_num_experts: int,
+        num_ubatches: int,
+    ) -> int:
+        """Reserve deterministic workspace for data-dependent routed tokens."""
+        if not (
+            self.is_dp_ep
+            and self.moe_parallel_config is not None
+            and self.moe_parallel_config.use_deepep_ht_kernels
+            and self.prepare_finalize.activation_format
+            == FusedMoEActivationFormat.Standard
+        ):
+            return 0
+
+        max_tokens_per_rank = self.prepare_finalize.max_num_tokens_per_rank()
+        if max_tokens_per_rank is None:
+            return 0
+
+        # DeepEP HT's receive-side capacity is set by each dispatching rank's
+        # full max-token budget. DBO usually splits scheduler batches in half,
+        # but that split is not part of the backend capacity contract and does
+        # not bound the routed tokens the expert kernel must tolerate.
+        num_ubatches = max(num_ubatches, 1)
+        max_m = max_tokens_per_rank * self.prepare_finalize.num_dispatchers()
+        if max_m <= 0:
+            return 0
+
+        hidden_dim = self.fused_experts.moe_config.hidden_dim
+        probe_a1 = torch.empty((1, hidden_dim), dtype=out_dtype, device=device)
+        probe_topk_ids = torch.empty((1, top_k), dtype=torch.int64, device=device)
+        _, _, N, K, resolved_top_k = self.fused_experts.moe_problem_size(
+            probe_a1,
+            w1,
+            w2,
+            probe_topk_ids,
+        )
+        del probe_a1, probe_topk_ids
+
+        workspace_dtype = self.fused_experts.workspace_dtype(out_dtype)
+        workspace13_shape, workspace2_shape, _ = self.fused_experts.workspace_shapes(
+            max_m,
+            N,
+            K,
+            resolved_top_k,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta=None,
+            activation=activation,
+        )
+        _, _, fused_out_shape = self.fused_experts.workspace_shapes(
+            max_m,
+            N,
+            K,
+            resolved_top_k,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta=None,
+            activation=activation,
+        )
+
+        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        reserved_bytes = reserve_workspace_simultaneous(
+            ((max_shape_size,), workspace_dtype),
+            (workspace2_shape, workspace_dtype),
+            reason="DeepEP high-throughput MoE max routed tokens",
+        )
+        logger.info_once(
+            "Reserved DeepEP high-throughput MoE workspace for max routed "
+            "tokens: max_tokens_per_rank=%d num_dispatchers=%d "
+            "num_ubatches=%d max_m=%d top_k=%d local_experts=%d "
+            "workspace=%.2f MB",
+            max_tokens_per_rank,
+            self.prepare_finalize.num_dispatchers(),
+            num_ubatches,
+            max_m,
+            resolved_top_k,
+            local_num_experts,
+            reserved_bytes / (1024**2),
+        )
+        return reserved_bytes
 
     def _maybe_apply_shared_experts(
         self,
@@ -1597,6 +1700,32 @@ class FusedMoEKernel:
         is reduced across all ranks.
         """
         return self.prepare_finalize.output_is_reduced()
+
+    def reserve_max_workspace(
+        self,
+        out_dtype: torch.dtype,
+        device: torch.device,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        top_k: int,
+        activation: MoEActivation,
+        global_num_experts: int,
+        local_num_experts: int,
+        num_ubatches: int,
+    ) -> int:
+        if isinstance(self.impl, FusedMoEKernelModularImpl):
+            return self.impl.reserve_max_workspace(
+                out_dtype=out_dtype,
+                device=device,
+                w1=w1,
+                w2=w2,
+                top_k=top_k,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                local_num_experts=local_num_experts,
+                num_ubatches=num_ubatches,
+            )
+        return 0
 
     def apply_monolithic(
         self,

@@ -8,6 +8,13 @@ from typing import Any
 import torch
 
 
+def _breakable_cudagraph_capture_active() -> bool:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    capture = BreakableCUDAGraphCapture.current()
+    return capture is not None and capture._capturing
+
+
 class AuxStreamType(Enum):
     Attention = 1
 
@@ -23,6 +30,7 @@ def maybe_execute_in_parallel(
     event0: torch.cuda.Event,
     event1: torch.cuda.Event,
     aux_stream: torch.cuda.Stream | None = None,
+    enable: bool = True,
 ) -> tuple[Any, Any]:
     """Run two functions potentially in parallel on separate CUDA streams.
 
@@ -40,11 +48,17 @@ def maybe_execute_in_parallel(
         event1: CUDA event recorded after fn1 so default stream can wait.
         aux_stream: The second CUDA stream for fn1.
             Multi-stream is disabled when aux_stream is None.
+        enable: Opt-in switch for the multi-stream path. When False, both
+            functions execute sequentially on the current stream.
 
     Returns:
         Tuple of (fn0_result, fn1_result).
     """
-    if aux_stream is not None:
+    if (
+        aux_stream is not None
+        and enable
+        and not _breakable_cudagraph_capture_active()
+    ):
         event0.record()
         result0 = fn0()
         with torch.cuda.stream(aux_stream):
@@ -98,7 +112,7 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
-    if aux_streams is None or not enable:
+    if aux_streams is None or not enable or _breakable_cudagraph_capture_active():
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
         return default_result, aux_results

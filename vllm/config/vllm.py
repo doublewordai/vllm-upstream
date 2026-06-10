@@ -1311,6 +1311,7 @@ class VllmConfig:
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
+            use_ubatching=self.parallel_config.use_ubatching,
         )
 
         if self.compilation_config.pass_config.enable_sp:

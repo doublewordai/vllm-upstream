@@ -8,8 +8,12 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_full_capture,
+    is_dbo_breakable_cudagraph_enabled,
+)
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -474,6 +478,10 @@ class DeepseekV4MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
 
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.num_experts_per_tok
@@ -665,6 +673,34 @@ class DeepseekV4MoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights()
+
+
+@eager_break_during_full_capture
+def deepseek_v4_ffn(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    ffn = get_forward_context().no_compile_layers[layer_name]
+    out.copy_(ffn(hidden_states, input_ids), non_blocking=True)
+
+
+def deepseek_v4_ffn_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_ffn",
+    op_func=deepseek_v4_ffn,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_ffn_fake,
+)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -867,6 +903,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             aux_stream_list=aux_stream_list,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        parallel_config = vllm_config.parallel_config
+        self.use_dbo_ffn_eager_break = (
+            is_dbo_breakable_cudagraph_enabled()
+            and parallel_config.use_ubatching
+            and parallel_config.all2all_backend == "deepep_high_throughput"
+            and parallel_config.data_parallel_size > 1
+            and vllm_config.compilation_config.cudagraph_mode is not CUDAGraphMode.NONE
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -921,6 +965,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def _run_ffn(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.use_dbo_ffn_eager_break:
+            return self.ffn(x, input_ids)
+        ffn_out = torch.empty_like(x)
+        torch.ops.vllm.deepseek_v4_ffn(
+            x,
+            input_ids,
+            ffn_out,
+            self.ffn.prefix,
+        )
+        return ffn_out
 
     def hc_pre(
         self,
@@ -1021,7 +1081,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=ffn_norm_eps,
         )
 
-        x = self.ffn(x, input_ids)
+        x = self._run_ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
     def _forward_native(
@@ -1048,7 +1108,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        x = self._run_ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
 
