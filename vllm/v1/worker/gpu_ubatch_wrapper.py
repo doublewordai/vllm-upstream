@@ -455,6 +455,27 @@ class UBatchWrapper:
         ubatch_slices = forward_context.ubatch_slices
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+        if envs.VLLM_UBATCH_DEBUG_LOGGING:
+            self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
+            if self._dbg_calls % 20 == 1:
+                bd_tokens = (
+                    batch_descriptor.num_tokens
+                    if batch_descriptor is not None
+                    else None
+                )
+                logger.info(
+                    "[ubatch-dbg] call=%d bd_tokens=%s mode=%s slices=%s "
+                    "slice_tokens=%s cached_keys=%s",
+                    self._dbg_calls,
+                    bd_tokens,
+                    cudagraph_runtime_mode,
+                    None if ubatch_slices is None else len(ubatch_slices),
+                    None
+                    if ubatch_slices is None
+                    else [s.num_tokens for s in ubatch_slices],
+                    sorted(self.cudagraphs.keys()),
+                )
+
         # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
             # This is to account for the case where ubatching was aborted.

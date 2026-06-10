@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_UBATCH_DEBUG_LOGGING: bool = False
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -1827,6 +1828,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL", "0"))
     ),
+    # Periodically log UBatchWrapper dispatch decisions (batch tokens,
+    # runtime mode, ubatch slices, captured graph keys). Debug aid for
+    # diagnosing why ubatched steps replay vs fall back to eager.
+    "VLLM_UBATCH_DEBUG_LOGGING": lambda: os.getenv("VLLM_UBATCH_DEBUG_LOGGING", "0")
+    in ("1", "true", "True"),
     # The number of SMs/CUs to allocate for communication kernels when
     # running DBO; the rest will be allocated to compute.
     # Default: 20 on CUDA (SMs), 64 on ROCm (CUs).
