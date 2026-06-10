@@ -98,7 +98,16 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if not is_forward_context_available():
             return 0
         ctx = get_forward_context()
-        if ctx.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+        # UBatchWrapper passes cudagraph_runtime_mode=NONE into the
+        # per-ubatch forward contexts while CAPTURING a full ubatched
+        # graph, so the context mode alone misses exactly the case that
+        # must not record the host-synced protocol (its CPU poll waits on
+        # a kernel that never executes under capture). Check the stream's
+        # capture status directly as well.
+        if (
+            ctx.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             return 0
         return tokens.size(0) * self.num_dispatchers_
 
