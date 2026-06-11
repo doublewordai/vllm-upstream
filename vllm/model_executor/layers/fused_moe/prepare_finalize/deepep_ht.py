@@ -71,6 +71,18 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # micro-batch to avoid races between threads.
         self.handles = [None, None]
 
+        # Lamport-clock counters for host-issued dispatch/combine calls,
+        # reported in the timeout annotations below. Healthy EP ranks
+        # advance these in lockstep (graph REPLAYS bump no rank's counter
+        # since no Python runs, and the runtime mode is synced across DP
+        # ranks per step), so on a collective timeout, comparing values
+        # across ranks' logs separates "all ranks in the same stuck
+        # collective" (transport) from "ranks in different collectives"
+        # (scheduling desync) — and seq mod num-moe-layers localizes the
+        # layer.
+        self.dispatch_seq = 0
+        self.combine_seq = 0
+
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
 
@@ -190,6 +202,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             token_data = (tokens, token_scales)
 
         num_worst_tokens = self._num_worst_tokens(tokens)
+        self.dispatch_seq += 1
         try:
             (
                 token_data,
@@ -228,6 +241,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         except RuntimeError as exc:
             raise RuntimeError(
                 f"{exc} [deepep-ht dispatch debug: "
+                f"seq={self.dispatch_seq} ubatch={dbo_current_ubatch_id()} "
                 f"tokens={tokens.shape[0]} worst={num_worst_tokens} "
                 f"{self._step_debug()}]"
             ) from exc
@@ -444,6 +458,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
+        self.combine_seq += 1
         try:
             combined_x, _, event = self.buffer.combine(
             # HT combine only supports BF16
@@ -462,6 +477,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         except RuntimeError as exc:
             raise RuntimeError(
                 f"{exc} [deepep-ht combine debug: "
+                f"seq={self.combine_seq} ubatch={dbo_current_ubatch_id()} "
                 f"tokens={fused_expert_output.shape[0]} {self._step_debug()}]"
             ) from exc
 
