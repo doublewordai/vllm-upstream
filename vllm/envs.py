@@ -152,6 +152,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH: bool = False
+    VLLM_DP_TRACE: bool = False
+    VLLM_DP_LB_P2C: bool = False
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -726,6 +728,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH": lambda: (
         os.environ.get("VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH", "0") == "1"
     ),
+    # Trace DP wave/step protocol events (finish-sync votes, engine
+    # sleep/wake, wave starts) at INFO level. Debug aid for DP wave
+    # coordination issues; low rate (one line per 32-step sync per engine).
+    "VLLM_DP_TRACE": lambda: os.environ.get("VLLM_DP_TRACE", "0") == "1",
+    # Use power-of-two-choices for DP load balancing instead of the global
+    # min-score scan. Randomization prevents multiple API servers from
+    # herding onto the same engine between coordinator count refreshes.
+    "VLLM_DP_LB_P2C": lambda: os.environ.get("VLLM_DP_LB_P2C", "0") == "1",
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
     "VLLM_PATTERN_MATCH_DEBUG": lambda: os.environ.get(

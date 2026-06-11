@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import queue
+import random
 import sys
 import uuid
 import weakref
@@ -20,6 +21,7 @@ import msgspec.msgpack
 import zmq
 import zmq.asyncio
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
@@ -1378,6 +1380,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        self.use_p2c = envs.VLLM_DP_LB_P2C and len(self.core_engines) > 2
+        if self.use_p2c:
+            logger.info_once("DP load balancing using power-of-two-choices.")
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1387,19 +1392,36 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
         ) is None:
             current_counts = self.lb_engines
-            # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
+            if self.use_p2c:
+                # Power-of-two-choices: sample two engines, pick the less
+                # loaded. The global min-score scan below converges every
+                # API server process onto the same engine between
+                # coordinator count refreshes (~100ms) -- requests queued
+                # in an engine's input socket are invisible to the counts,
+                # so under slow steps the herd can pin one engine at
+                # capacity while others sit empty. Random pairing bounds
+                # that skew regardless of count staleness.
+                a, b = random.sample(range(num_engines), 2)
+
+                def _score(i: int) -> int:
+                    waiting, running = current_counts[i]
+                    return waiting * 4 + running
+
+                eng_index = a if _score(a) <= _score(b) else b
+            else:
+                # TODO use P2C alg for larger DP sizes
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    # Start from client_index to help with balancing when
+                    # engines are empty.
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting, running = current_counts[idx]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count

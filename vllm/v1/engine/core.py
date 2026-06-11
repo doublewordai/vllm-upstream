@@ -1218,6 +1218,14 @@ class EngineCoreProc(EngineCore):
             try:
                 req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
+                # Requests handled while the engine is idle (e.g. aborts
+                # draining a paused engine) change state that subclasses may
+                # publish externally. Without this hook the loop re-blocks on
+                # queue.get() without ever returning to run_busy_loop, so a
+                # DP engine drained by aborts while paused never publishes
+                # its zeroed request counts -- the load balancer then avoids
+                # it forever and it can never be woken by new traffic.
+                self._publish_idle_state()
             except queue.Empty:
                 break
             if not block:
@@ -1230,6 +1238,10 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+    def _publish_idle_state(self) -> None:
+        """Hook: publish externally-visible state changes produced while
+        idle. No-op for single-engine; DP engines publish request counts."""
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1739,6 +1751,12 @@ class DPEngineCoreProc(EngineCoreProc):
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
         if self.has_coordinator and request_wave != self.current_wave:
+            if envs.VLLM_DP_TRACE:
+                logger.info(
+                    "[dp-trace] add_request wave mismatch: request_wave=%d "
+                    "current_wave=%d engines_running=%s",
+                    request_wave, self.current_wave, self.engines_running,
+                )
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
             elif (
@@ -1787,6 +1805,13 @@ class DPEngineCoreProc(EngineCoreProc):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
+            if envs.VLLM_DP_TRACE:
+                logger.info(
+                    "[dp-trace] START_DP_WAVE recv new_wave=%s exclude=%s "
+                    "current_wave=%d engines_running=%s ignore=%s",
+                    request[0], request[1], self.current_wave,
+                    self.engines_running, self.ignore_start_dp_wave,
+                )
             if self.ignore_start_dp_wave:
                 return
             new_wave, exclude_eng_index = request
@@ -1815,6 +1840,18 @@ class DPEngineCoreProc(EngineCoreProc):
                 *counts, step_counter=self.step_counter, current_wave=self.current_wave
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+            if envs.VLLM_DP_TRACE:
+                logger.info(
+                    "[dp-trace] publish counts waiting=%d running=%d "
+                    "step=%d wave=%d running_state=%s",
+                    counts[0], counts[1], self.step_counter,
+                    self.current_wave, self.engines_running,
+                )
+
+    def _publish_idle_state(self) -> None:
+        # See EngineCoreProc._publish_idle_state: keep the LB's view of this
+        # engine fresh even when state changes without waking the step loop.
+        self._maybe_publish_request_counts()
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -1853,6 +1890,13 @@ class DPEngineCoreProc(EngineCoreProc):
             )
 
             if not self.engines_running:
+                if envs.VLLM_DP_TRACE:
+                    counts = self.scheduler.get_request_counts()
+                    logger.info(
+                        "[dp-trace] SLEEP wave=%d step=%d waiting=%d running=%d",
+                        self.current_wave, self.step_counter,
+                        counts[0], counts[1],
+                    )
                 if self.dp_rank == 0 or not self.has_coordinator:
                     # Notify client that we are pausing the loop.
                     logger.debug(
@@ -1885,6 +1929,16 @@ class DPEngineCoreProc(EngineCoreProc):
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
         )
+
+        if envs.VLLM_DP_TRACE:
+            counts = self.scheduler.get_request_counts()
+            logger.info(
+                "[dp-trace] finish-sync step=%d wave=%d local_unfinished=%s "
+                "-> global_unfinished=%s pause_consensus=%s "
+                "waiting=%d running=%d",
+                self.step_counter, self.current_wave, local_unfinished,
+                has_unfinished, pause_consensus, counts[0], counts[1],
+            )
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -143,6 +144,36 @@ class UBatchWrapper:
         self.device = device
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+
+        # Execution-mode counters, logged periodically: direct evidence of
+        # whether steps run as ubatched-graph replays (TBO inside CUDA
+        # graphs), eager ubatched, eager plain, or fresh captures.
+        self._mode_counts = {
+            "ubatched_replay": 0,
+            "ubatched_eager": 0,
+            "ubatched_capture": 0,
+            "plain_eager": 0,
+            "plain_graph": 0,
+        }
+        self._mode_last_log = time.monotonic()
+
+    _MODE_LOG_INTERVAL_S = 30.0
+
+    def _count_mode(self, mode: str) -> None:
+        self._mode_counts[mode] += 1
+        now = time.monotonic()
+        if now - self._mode_last_log >= self._MODE_LOG_INTERVAL_S:
+            self._mode_last_log = now
+            c = self._mode_counts
+            logger.info(
+                "[tbo-modes] last %ds: ubatched_replay=%d ubatched_eager=%d "
+                "ubatched_capture=%d plain_eager=%d plain_graph=%d",
+                int(self._MODE_LOG_INTERVAL_S), c["ubatched_replay"],
+                c["ubatched_eager"], c["ubatched_capture"],
+                c["plain_eager"], c["plain_graph"],
+            )
+            for k in c:
+                c[k] = 0
 
     @property
     def graph_pool(self):
@@ -503,9 +534,11 @@ class UBatchWrapper:
                     CUDAGraphMode.NONE,
                     CUDAGraphMode.PIECEWISE,
                 ):
+                    self._count_mode("plain_eager")
                     return self.runnable(*args, **kwargs)
                 else:
                     assert self.cudagraph_wrapper is not None
+                    self._count_mode("plain_graph")
                     return self.cudagraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata
@@ -553,6 +586,7 @@ class UBatchWrapper:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 for_capture=True,
             )
+            self._count_mode("ubatched_capture")
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.runnable)
         elif (
@@ -563,6 +597,7 @@ class UBatchWrapper:
             # Sync offloader before replay - ensures any external dependencies
             # from pre-capture prefetches are satisfied.
             get_offloader().sync_prev_onload()
+            self._count_mode("ubatched_replay")
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:
@@ -579,5 +614,6 @@ class UBatchWrapper:
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
+            self._count_mode("ubatched_eager")
             with self.sm_control:
                 return self._run_ubatches(ubatch_metadata, self.runnable)

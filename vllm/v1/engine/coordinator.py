@@ -9,6 +9,7 @@ import weakref
 import msgspec.msgpack
 import zmq
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
@@ -203,6 +204,10 @@ class DPCoordinatorProc:
         last_stats_wave = -1
         last_step_counts: list[list[int]] | None = None
 
+        # Wake-watchdog state (see the poller-timeout branch).
+        last_stats_recv_time = time.time()
+        last_watchdog_time = 0.0
+
         with (
             make_zmq_socket(
                 path=front_publish_address,  # IPC
@@ -275,6 +280,39 @@ class DPCoordinatorProc:
                     to_publish = (engine_req_counts_list, current_wave, engines_running)
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
+
+                    # Wake watchdog: the wave protocol has message races
+                    # (e.g. a front-end's new-request notification crossing a
+                    # wave_complete) that can strand work on paused engines
+                    # indefinitely -- nothing in the protocol retries. Since
+                    # START_DP_WAVE is idempotent for running engines, the
+                    # coordinator re-broadcasts it whenever its view shows
+                    # unfinished work as a bounded-time safety net:
+                    #  - engines believed paused: any reported work is
+                    #    anomalous, re-wake immediately at this cadence;
+                    #  - engines believed running: only if no stats update
+                    #    has arrived for a long interval (a stepping cluster
+                    #    publishes every step), covering a stale running
+                    #    belief.
+                    if self.enable_wave_coordination:
+                        now_s = time.time()
+                        has_work = any(
+                            c[0] > 0 or c[1] > 0 for c in engine_req_counts_list
+                        )
+                        stats_silence = now_s - last_stats_recv_time
+                        should_rewake = has_work and (
+                            not engines_running or stats_silence > 30.0
+                        )
+                        if should_rewake and now_s - last_watchdog_time > 10.0:
+                            last_watchdog_time = now_s
+                            logger.warning(
+                                "DP wake watchdog: unfinished work visible "
+                                "(engines_running=%s, stats silence %.0fs); "
+                                "re-broadcasting START_DP_WAVE wave=%d.",
+                                engines_running, stats_silence, current_wave,
+                            )
+                            engines_running = True
+                            self._send_start_wave(publish_back, current_wave, None)
                     continue
 
                 events = dict(events)
@@ -354,8 +392,25 @@ class DPCoordinatorProc:
 
                             engines_running = True
                             wave_state_changed = True
+                            if envs.VLLM_DP_TRACE:
+                                logger.info(
+                                    "[dp-trace] coord: frontend new-request "
+                                    "wake; sending START_DP_WAVE wave=%d "
+                                    "exclude=%s",
+                                    current_wave, engine_to_exclude,
+                                )
                             self._send_start_wave(
                                 publish_back, current_wave, engine_to_exclude
+                            )
+                        elif envs.VLLM_DP_TRACE:
+                            # New-request notification swallowed because the
+                            # coordinator believes engines are running. If
+                            # that belief is stale, this is a lost wake-up.
+                            logger.info(
+                                "[dp-trace] coord: frontend new-request "
+                                "notification ignored (engines_running=True, "
+                                "wave=%d msg_wave=%s)",
+                                current_wave, wave,
                             )
 
                 if output_back in events:
@@ -400,6 +455,7 @@ class DPCoordinatorProc:
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
                         stats_changed = True
+                        last_stats_recv_time = time.time()
 
                     # Wave coordination: handle wave completion and start notifications
                     # Only process these when wave coordination is enabled
@@ -408,6 +464,12 @@ class DPCoordinatorProc:
                             # 2. Notification from rank 0 engine that we've
                             # moved into the global paused state
                             # (engines_running==False).
+                            if envs.VLLM_DP_TRACE:
+                                logger.info(
+                                    "[dp-trace] coord: wave_complete=%d recv "
+                                    "(current_wave=%d engines_running=%s)",
+                                    wave, current_wave, engines_running,
+                                )
                             if current_wave <= wave:
                                 new_wave = wave + 1
                                 logger.debug(
@@ -430,6 +492,12 @@ class DPCoordinatorProc:
                                 "stale wave request from engine.",
                                 wave,
                             )
+                            if envs.VLLM_DP_TRACE:
+                                logger.info(
+                                    "[dp-trace] coord: engine %d start_wave=%d "
+                                    "notification; sending START_DP_WAVE",
+                                    eng_index, wave,
+                                )
                             current_wave = wave
                             engines_running = True
                             wave_state_changed = True
