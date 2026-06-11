@@ -157,23 +157,35 @@ def dbo_current_ubatch_id() -> int:
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
 
-def _register_ubatch_function(func):
+def _register_ubatch_function(func, break_cudagraph_capture: bool = False):
     def wrapper(*args, **kwargs):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
             ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
             ctx = _CURRENT_CONTEXTS[ctx_idx]
-            func(ctx, *args, **kwargs)
+            if break_cudagraph_capture:
+                from vllm.compilation.breakable_cudagraph import (
+                    BreakableCUDAGraphCapture,
+                )
+
+                capture = BreakableCUDAGraphCapture.current()
+                if capture is not None and capture._capturing:
+                    return capture.add_eager(lambda: func(ctx, *args, **kwargs))
+            return func(ctx, *args, **kwargs)
 
     return wrapper
 
 
 dbo_maybe_run_recv_hook = _register_ubatch_function(UBatchContext.maybe_run_recv_hook)
-dbo_yield = _register_ubatch_function(UBatchContext.yield_)
+dbo_yield = _register_ubatch_function(
+    UBatchContext.yield_, break_cudagraph_capture=True
+)
 dbo_yield_and_switch_from_compute_to_comm = _register_ubatch_function(
-    UBatchContext.yield_and_switch_from_compute_to_comm
+    UBatchContext.yield_and_switch_from_compute_to_comm,
+    break_cudagraph_capture=True,
 )
 dbo_yield_and_switch_from_comm_to_compute = _register_ubatch_function(
-    UBatchContext.yield_and_switch_from_comm_to_compute
+    UBatchContext.yield_and_switch_from_comm_to_compute,
+    break_cudagraph_capture=True,
 )
 dbo_switch_to_comm = _register_ubatch_function(UBatchContext.switch_to_comm)
 dbo_switch_to_compute = _register_ubatch_function(UBatchContext.switch_to_compute)

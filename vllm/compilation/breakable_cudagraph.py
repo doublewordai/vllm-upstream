@@ -53,10 +53,20 @@ def is_breakable_cudagraph_enabled() -> bool:
     return bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)
 
 
+def is_dbo_breakable_cudagraph_enabled() -> bool:
+    return bool(envs.VLLM_DBO_BREAKABLE_CUDAGRAPH)
+
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def eager_break_during_capture(fn: F) -> F:
+def _should_install_eager_break(*, break_full: bool) -> bool:
+    if is_breakable_cudagraph_enabled():
+        return True
+    return break_full and is_dbo_breakable_cudagraph_enabled()
+
+
+def _eager_break_during_capture(fn: F, *, break_full: bool) -> F:
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -87,11 +97,13 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
+    if not _should_install_eager_break(break_full=break_full):
         return fn
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not _should_install_eager_break(break_full=break_full):
+            return fn(*args, **kwargs)
         capture = BreakableCUDAGraphCapture.current()
         if capture is None:
             return fn(*args, **kwargs)
@@ -99,7 +111,9 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
+            if break_full and mode != CUDAGraphMode.FULL:
+                return fn(*args, **kwargs)
+            if not break_full and mode == CUDAGraphMode.FULL:
                 return fn(*args, **kwargs)
 
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
@@ -115,6 +129,14 @@ def eager_break_during_capture(fn: F) -> F:
         return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
 
     return wrapper  # type: ignore[return-value]
+
+
+def eager_break_during_capture(fn: F) -> F:
+    return _eager_break_during_capture(fn, break_full=False)
+
+
+def eager_break_during_full_capture(fn: F) -> F:
+    return _eager_break_during_capture(fn, break_full=True)
 
 
 # ---------------------------------------------------------------------------

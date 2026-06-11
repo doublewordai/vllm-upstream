@@ -89,6 +89,43 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def reserve_bytes(self, required_bytes: int, reason: str) -> None:
+        """Ensure every ubatch workspace can hold a deterministic allocation."""
+        assert not self._locked, "Cannot reserve workspace after locking"
+        assert required_bytes >= 0
+
+        for ubatch_id, current_workspace in enumerate(self._current_workspaces):
+            current_size = self._workspace_size_bytes(current_workspace)
+            if required_bytes <= current_size:
+                continue
+
+            self._current_workspaces[ubatch_id] = None
+            del current_workspace
+            torch.accelerator.empty_cache()
+            self._current_workspaces[ubatch_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+            logger.info(
+                "Reserved workspace for %s: %.2f MB -> %.2f MB "
+                "(ubatch %d)",
+                reason,
+                current_size / _MB,
+                required_bytes / _MB,
+                ubatch_id,
+            )
+
+    def reserve_simultaneous(
+        self,
+        *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype],
+        reason: str,
+    ) -> int:
+        """Reserve room for tensors allocated together by get_simultaneous."""
+        actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
+        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        total_bytes = sum(aligned_bytes)
+        self.reserve_bytes(total_bytes, reason)
+        return total_bytes
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
@@ -256,6 +293,17 @@ def lock_workspace() -> None:
         # Now all get_workspace calls must fit in pre-allocated size
     """
     current_workspace_manager().lock()
+
+
+def reserve_workspace_simultaneous(
+    *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype],
+    reason: str,
+) -> int:
+    """Reserve room for tensors allocated together by get_simultaneous."""
+    return current_workspace_manager().reserve_simultaneous(
+        *shapes_and_dtypes,
+        reason=reason,
+    )
 
 
 def unlock_workspace() -> None:

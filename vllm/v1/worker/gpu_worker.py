@@ -596,14 +596,28 @@ class Worker(WorkerBase):
                     warmup_sizes.append(compile_range.end)
 
         # We skip EPLB here since we don't want to record dummy metrics
+        allow_startup_microbatching = (
+            not self.model_runner._uses_dbo_breakable_cudagraphs()
+        )
+        if not allow_startup_microbatching:
+            logger.info(
+                "Running startup compile/kernel warmups without DBO "
+                "microbatching; DBO CUDA graph capture and serving remain "
+                "enabled."
+            )
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            self.model_runner._dummy_run(
+                size,
+                skip_eplb=True,
+                remove_lora=False,
+                allow_microbatching=allow_startup_microbatching,
+            )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        kernel_warmup(self, allow_microbatching=allow_startup_microbatching)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:

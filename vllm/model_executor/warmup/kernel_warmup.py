@@ -52,7 +52,7 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
     return output_dir / "autotune_configs.json"
 
 
-def kernel_warmup(worker: "Worker"):
+def kernel_warmup(worker: "Worker", allow_microbatching: bool = True):
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
         envs.VLLM_USE_DEEP_GEMM
@@ -71,7 +71,10 @@ def kernel_warmup(worker: "Worker"):
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+        flashinfer_autotune(
+            worker.model_runner,
+            allow_microbatching=allow_microbatching,
+        )
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -103,6 +106,7 @@ def kernel_warmup(worker: "Worker"):
             is_profile=True,
             force_attention=True,
             create_mixed_batch=True,
+            allow_microbatching=allow_microbatching,
         )
 
 
@@ -112,7 +116,9 @@ def kernel_warmup(worker: "Worker"):
 _FLASHINFER_USE_PERSISTENT_CACHE = False
 
 
-def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+def flashinfer_autotune(
+    runner: "GPUModelRunner", allow_microbatching: bool = True
+) -> None:
     """
     Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
@@ -128,12 +134,19 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
+    if not allow_microbatching:
+        logger.info(
+            "Running FlashInfer autotune without DBO microbatching during "
+            "startup warmup."
+        )
+
     if not _FLASHINFER_USE_PERSISTENT_CACHE:
         with torch.inference_mode(), fi_utils.autotune():
             runner._dummy_run(
                 num_tokens=runner.scheduler_config.max_num_batched_tokens,
                 skip_eplb=True,
                 is_profile=True,
+                allow_microbatching=allow_microbatching,
             )
         get_world_group().barrier()
         return
@@ -153,6 +166,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
+        allow_microbatching=allow_microbatching,
     )
 
     with torch.inference_mode():

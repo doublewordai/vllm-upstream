@@ -4,6 +4,7 @@
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
@@ -61,15 +62,35 @@ def _post_process_ubatch(tensor: torch.Tensor, num_ubatches: int) -> bool:
     # First determine if we are going to be ubatching.
     should_ubatch: bool = bool(torch.all(tensor[2] == 1).item())
     if not should_ubatch:
+        if (
+            envs.VLLM_DBO_DEBUG_LOGGING
+            and bool(torch.any(tensor[2] == 1).item())
+        ):
+            logger.info(
+                "Aborting DBO because not all DP ranks voted for ubatching: "
+                "votes=%s orig_tokens=%s padded_tokens=%s num_ubatches=%d",
+                tensor[2, :].detach().cpu().tolist(),
+                orig_num_tokens_tensor.detach().cpu().tolist(),
+                padded_num_tokens_tensor.detach().cpu().tolist(),
+                num_ubatches,
+            )
         return False
     # If the DP ranks are planning to ubatch, make sure every microbatch
     # has at least one real token.
     orig_min_num_tokens = int(orig_num_tokens_tensor.min().item())
     padded_max_num_tokens = int(padded_num_tokens_tensor.max().item())
     if has_empty_ubatch(orig_min_num_tokens, padded_max_num_tokens, num_ubatches):
-        logger.debug(
-            "Aborting ubatching %s %s", orig_min_num_tokens, padded_max_num_tokens
-        )
+        if envs.VLLM_DBO_DEBUG_LOGGING:
+            logger.info(
+                "Aborting DBO because at least one DP rank would have an empty "
+                "microbatch: orig_tokens=%s padded_tokens=%s "
+                "orig_min_tokens=%d padded_max_tokens=%d num_ubatches=%d",
+                orig_num_tokens_tensor.detach().cpu().tolist(),
+                padded_num_tokens_tensor.detach().cpu().tolist(),
+                orig_min_num_tokens,
+                padded_max_num_tokens,
+                num_ubatches,
+            )
         should_ubatch = False
     return should_ubatch
 

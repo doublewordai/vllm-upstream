@@ -9,6 +9,7 @@ import weakref
 import msgspec.msgpack
 import zmq
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
@@ -155,6 +156,7 @@ class DPCoordinatorProc:
 
         self.stats_update_interval_ms = min_stats_update_interval_ms
         self.enable_wave_coordination = enable_wave_coordination
+        self.start_wave_coalesce_ms = max(0, envs.VLLM_DP_START_WAVE_COALESCE_MS)
 
     @staticmethod
     def run_coordinator(
@@ -351,6 +353,14 @@ class DPCoordinatorProc:
                                 # If the wave number is stale, ensure the message
                                 # is handled by all the engines.
                                 engine_to_exclude = None
+                            elif self.start_wave_coalesce_ms:
+                                logger.info(
+                                    "Coalescing DP start wave %d for %d ms "
+                                    "before START_DP_WAVE.",
+                                    current_wave,
+                                    self.start_wave_coalesce_ms,
+                                )
+                                time.sleep(self.start_wave_coalesce_ms / 1000)
 
                             engines_running = True
                             wave_state_changed = True
