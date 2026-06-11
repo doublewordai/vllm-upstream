@@ -1897,6 +1897,22 @@ class DPEngineCoreProc(EngineCoreProc):
                         self.current_wave, self.step_counter,
                         counts[0], counts[1],
                     )
+                # Force-publish a paused marker (bypassing the changed-counts
+                # check) so the coordinator can tell "asleep" apart from
+                # "busy with constant counts" and re-wake the group if work
+                # exists elsewhere.
+                if self.publish_dp_lb_stats:
+                    counts = self.scheduler.get_request_counts()
+                    self.last_counts = counts
+                    self.output_queue.put_nowait((
+                        -1,
+                        EngineCoreOutputs(scheduler_stats=SchedulerStats(
+                            *counts,
+                            step_counter=self.step_counter,
+                            current_wave=self.current_wave,
+                            engines_paused=True,
+                        )),
+                    ))
                 if self.dp_rank == 0 or not self.has_coordinator:
                     # Notify client that we are pausing the loop.
                     logger.debug(

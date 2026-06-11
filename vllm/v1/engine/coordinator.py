@@ -205,7 +205,7 @@ class DPCoordinatorProc:
         last_step_counts: list[list[int]] | None = None
 
         # Wake-watchdog state (see the poller-timeout branch).
-        last_stats_recv_time = time.time()
+        engine_paused: dict[int, bool] = {}
         last_watchdog_time = 0.0
 
         with (
@@ -299,19 +299,27 @@ class DPCoordinatorProc:
                         has_work = any(
                             c[0] > 0 or c[1] > 0 for c in engine_req_counts_list
                         )
-                        stats_silence = now_s - last_stats_recv_time
+                        paused = sorted(
+                            i for i, p in engine_paused.items() if p
+                        )
+                        # Engines explicitly report entering the paused state;
+                        # any engine asleep while work exists anywhere in the
+                        # group is a lost wake-up (the invariant the wave
+                        # protocol must maintain), independent of whose view
+                        # of engines_running is stale.
                         should_rewake = has_work and (
-                            not engines_running or stats_silence > 30.0
+                            not engines_running or bool(paused)
                         )
                         if should_rewake and now_s - last_watchdog_time > 10.0:
                             last_watchdog_time = now_s
                             logger.warning(
                                 "DP wake watchdog: unfinished work visible "
-                                "(engines_running=%s, stats silence %.0fs); "
+                                "(engines_running=%s, paused_engines=%s); "
                                 "re-broadcasting START_DP_WAVE wave=%d.",
-                                engines_running, stats_silence, current_wave,
+                                engines_running, paused, current_wave,
                             )
                             engines_running = True
+                            engine_paused.clear()
                             self._send_start_wave(publish_back, current_wave, None)
                     continue
 
@@ -455,7 +463,7 @@ class DPCoordinatorProc:
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
                         stats_changed = True
-                        last_stats_recv_time = time.time()
+                        engine_paused[eng_index] = scheduler_stats.engines_paused
 
                     # Wave coordination: handle wave completion and start notifications
                     # Only process these when wave coordination is enabled
