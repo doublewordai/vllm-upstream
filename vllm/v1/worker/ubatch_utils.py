@@ -30,10 +30,23 @@ UBatchSlices: TypeAlias = list[UBatchSlice]
 
 
 def ensure_tensor_alignment(
-    tensor: torch.Tensor, alignment: int = 64
+    tensor: torch.Tensor, alignment: int = 64, allow_clone: bool = True
 ) -> torch.Tensor:
     if tensor.is_contiguous() and tensor.data_ptr() % alignment == 0:
         return tensor
+    if not allow_clone:
+        # A clone made while preparing a CUDA-graph capture would be read by
+        # the captured kernels at its frozen capture-time address: replays
+        # would silently consume stale data. Callers on a capture path must
+        # use slice offsets that keep views aligned (in practice: capture
+        # sizes that are multiples of 32 tokens).
+        raise RuntimeError(
+            f"ubatch slice is not contiguous/{alignment}B-aligned "
+            f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"data_ptr%{alignment}={tensor.data_ptr() % alignment}) and "
+            "cloning is not allowed under CUDA-graph capture; adjust "
+            "cudagraph_capture_sizes so ubatch splits stay aligned."
+        )
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
@@ -79,7 +92,7 @@ def maybe_create_ubatch_slices(
     num_tokens_padded: int,
     num_reqs_padded: int,
     num_ubatches: int,
-    split_point: list[int] | int | None = None,
+    split_point: int | None = None,
 ) -> tuple[UBatchSlices | None, UBatchSlices | None]:
     if not should_ubatch:
         return None, None
@@ -90,12 +103,8 @@ def maybe_create_ubatch_slices(
 
     if split_point is None:
         split_point = num_tokens_padded // num_ubatches
-
-    if isinstance(split_point, list):
-        token_split_points = [int(point) for point in split_point]
-    else:
-        split_point = int(split_point)
-        token_split_points = [split_point * i for i in range(1, num_ubatches)]
+    split_point = int(split_point)
+    token_split_points = [split_point * i for i in range(1, num_ubatches)]
 
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)
@@ -111,7 +120,21 @@ def maybe_create_ubatch_slices(
     for end_token in all_points:
         end_token = int(end_token)
         if end_token <= start_token:
-            return None, None
+            # All DP ranks already agreed to ubatch via the all-reduce in
+            # coordinate_batch_across_dp, whose has_empty_ubatch() check
+            # (min orig tokens vs max padded tokens across ranks) provably
+            # covers this condition for every rank. Reaching it means that
+            # agreement is broken; silently falling back to an un-ubatched
+            # run here would issue half as many EP dispatches as the peer
+            # ranks and deadlock the whole DP group inside DeepEP. Fail
+            # loudly instead.
+            raise RuntimeError(
+                "Degenerate ubatch slice after DP-wide ubatch agreement: "
+                f"start_token={start_token}, end_token={end_token}, "
+                f"num_tokens_padded={num_tokens_padded}, "
+                f"split_points={token_split_points}, "
+                f"cu_num_tokens[-1]={int(cu_num_tokens[-1])}"
+            )
         token_slice = slice(start_token, end_token)
 
         # Determine request slices using exclusive stop semantics
@@ -156,7 +179,9 @@ def slice_query_start_locs(
 
 
 def _make_metadata_with_slice(
-    ubatch_slice: UBatchSlice, attn_metadata: CommonAttentionMetadata
+    ubatch_slice: UBatchSlice,
+    attn_metadata: CommonAttentionMetadata,
+    allow_clone: bool = True,
 ) -> CommonAttentionMetadata:
     """
     This function creates a new CommonAttentionMetadata that corresponds to
@@ -254,11 +279,15 @@ def _make_metadata_with_slice(
         max_query_len = attn_metadata.max_query_len
 
     block_table_tensor = ensure_tensor_alignment(
-        attn_metadata.block_table_tensor[request_slice]
+        attn_metadata.block_table_tensor[request_slice], allow_clone=allow_clone
     )
-    slot_mapping = ensure_tensor_alignment(attn_metadata.slot_mapping[token_slice])
+    slot_mapping = ensure_tensor_alignment(
+        attn_metadata.slot_mapping[token_slice], allow_clone=allow_clone
+    )
     positions = (
-        ensure_tensor_alignment(attn_metadata.positions[token_slice])
+        ensure_tensor_alignment(
+            attn_metadata.positions[token_slice], allow_clone=allow_clone
+        )
         if attn_metadata.positions is not None
         else None
     )
@@ -289,15 +318,23 @@ def _make_metadata_with_slice(
 def split_attn_metadata(
     ubatch_slices: list[UBatchSlice],
     common_attn_metadata: CommonAttentionMetadata,
+    allow_clone: bool = True,
 ) -> list[CommonAttentionMetadata]:
     """
     Creates a new CommonAttentionMetadata instance that corresponds to the
     requests for each UBatchSlice in ubatch_slices.
 
+    Pass allow_clone=False when the metadata feeds a CUDA-graph capture:
+    alignment fixups must not clone there (see ensure_tensor_alignment).
+
     Note: This function does not modify common_attn_metadata
     """
     results = []
     for ubatch_slice in ubatch_slices:
-        results.append(_make_metadata_with_slice(ubatch_slice, common_attn_metadata))
+        results.append(
+            _make_metadata_with_slice(
+                ubatch_slice, common_attn_metadata, allow_clone=allow_clone
+            )
+        )
 
     return results

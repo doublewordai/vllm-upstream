@@ -328,9 +328,31 @@ class UBatchWrapper:
             except threading.BrokenBarrierError as exc:
                 barrier_error = exc
             finally:
+                # While both threads are healthy they hand off via CPU
+                # events, so an unbounded join is correct. Once one thread
+                # has errored, its peer can be parked on a handoff event
+                # that will never be set; poll for that so a single thread
+                # failure can't silently wedge the whole worker.
                 for thread in ubatch_threads:
-                    thread.join()
+                    while thread.is_alive():
+                        thread.join(timeout=1)
+                        if errors or barrier_error is not None:
+                            break
+                if errors or barrier_error is not None:
+                    # Best-effort wake of any peer parked on a handoff
+                    # event (safe: this step is already failed and the
+                    # exception below is fatal to the engine core).
+                    for metadata in ubatch_metadata:
+                        metadata.context.cpu_wait_event.set()
+                    for thread in ubatch_threads:
+                        thread.join(timeout=30)
 
+        stuck = [t.name for t in ubatch_threads if t.is_alive()]
+        if stuck:
+            raise RuntimeError(
+                f"DBO ubatch thread(s) {stuck} failed to unwind after a peer "
+                "error; a thread is likely blocked inside a CUDA call."
+            ) from (errors[0] if errors else barrier_error)
         if errors:
             raise RuntimeError("DBO ubatch execution failed") from errors[0]
         if barrier_error is not None:
@@ -359,6 +381,7 @@ class UBatchWrapper:
         dp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
+        for_capture: bool = False,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
@@ -398,6 +421,10 @@ class UBatchWrapper:
                 positions,
                 inputs_embeds,
                 intermediate_tensors,
+                # Clones made while preparing a capture would be baked into
+                # the graph at their capture-time address and read stale
+                # data on every replay (see ensure_tensor_alignment).
+                allow_clone=not for_capture,
             )
             ubatch_metadata.append(
                 UbatchMetadata(
@@ -420,9 +447,10 @@ class UBatchWrapper:
         positions,
         inputs_embeds,
         intermediate_tensors,
+        allow_clone: bool = True,
     ):
         sliced_input_ids = (
-            ensure_tensor_alignment(input_ids[tokens_slice])
+            ensure_tensor_alignment(input_ids[tokens_slice], allow_clone=allow_clone)
             if input_ids is not None
             else None
         )
@@ -432,7 +460,9 @@ class UBatchWrapper:
             sliced_positions = positions[:, tokens_slice]
         else:
             sliced_positions = positions[tokens_slice]
-        sliced_positions = ensure_tensor_alignment(sliced_positions)
+        sliced_positions = ensure_tensor_alignment(
+            sliced_positions, allow_clone=allow_clone
+        )
         sliced_inputs_embeds = (
             inputs_embeds[tokens_slice] if inputs_embeds is not None else None
         )
@@ -521,6 +551,7 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                for_capture=True,
             )
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.runnable)

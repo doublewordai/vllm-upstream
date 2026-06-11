@@ -2435,7 +2435,10 @@ class GPUModelRunner(
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
-                    for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
+                    split_cms = split_attn_metadata(
+                        ubatch_slices, cm, allow_clone=not for_cudagraph_capture
+                    )
+                    for ubid, _cm in enumerate(split_cms):
                         _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
 
                 else:
