@@ -719,6 +719,21 @@ class Worker(WorkerBase):
 
         activate_triton_jit_monitor()
 
+        # Freeze the post-warmup heap in the worker process, mirroring what
+        # EngineCore.__init__ does for the engine proc. Without this, every
+        # gen-2 collection walks the full multi-million-object worker heap
+        # (model tree, captured graphs, compiled artifacts) — an occasional
+        # ~1s stop-the-world pause mid-step, and under EP any rank-local
+        # pause stalls the whole DP group at the next dispatch. The debug
+        # callback makes remaining collections visible via VLLM_GC_DEBUG=1.
+        from vllm.utils.gc_utils import (
+            freeze_gc_heap,
+            maybe_attach_gc_debug_callback,
+        )
+
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
