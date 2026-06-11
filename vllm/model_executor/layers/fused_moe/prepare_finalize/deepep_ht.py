@@ -55,14 +55,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def __init__(
         self,
         buffer: deep_ep.Buffer,
-        max_tokens_per_rank: int,
         num_dispatchers: int,
         dp_size: int,
         rank_expert_offset: int,
     ):
         super().__init__()
         self.buffer = buffer
-        self.max_tokens_per_rank = max_tokens_per_rank
         self.num_dispatchers_ = num_dispatchers
         self.dp_size = dp_size
         self.rank_expert_offset = rank_expert_offset
@@ -134,7 +132,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         return mk.FusedMoEActivationFormat.Standard
 
     def max_num_tokens_per_rank(self) -> int | None:
-        return self.max_tokens_per_rank
+        return None
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int64
