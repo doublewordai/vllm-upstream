@@ -43,7 +43,6 @@ class WorkspaceManager:
             None
         ] * self._num_ubatches
         self._locked: bool = False
-        self._spill_count: int = 0
 
     @staticmethod
     def _workspace_size_bytes(workspace: torch.Tensor | None) -> int:
@@ -155,29 +154,11 @@ class WorkspaceManager:
                 return "unknown"
 
             if self._locked:
-                # An eager step legitimately larger than anything warmup
-                # exercised (e.g. a decode batch above the largest captured
-                # CUDA graph). The locked workspace cannot be grown: captured
-                # graphs hold device pointers into it, and resizing frees
-                # memory those replays would still touch. Instead, serve this
-                # request from a transient spill buffer and leave the locked
-                # workspace (and every captured graph) untouched. The spill
-                # is allocator-pooled and only hit by over-cap eager steps,
-                # which are rare and already off the fast path.
-                self._spill_count += 1
-                if self._spill_count == 1 or self._spill_count % 100 == 0:
-                    logger.warning(
-                        "Workspace locked at %.2f MB but '%s' needs %.2f MB; "
-                        "serving from a transient spill buffer "
-                        "(occurrence %d). Over-cap eager step - consider "
-                        "raising the CUDA graph capture sizes.",
-                        current_size / _MB,
-                        get_caller_info(),
-                        required_bytes / _MB,
-                        self._spill_count,
-                    )
-                return torch.empty(
-                    (required_bytes,), dtype=torch.uint8, device=self._device
+                raise AssertionError(
+                    f"Workspace is locked but allocation from '{get_caller_info()}' "
+                    f"requires {required_bytes / _MB:.2f} MB, current size is "
+                    f"{current_size / _MB:.2f} MB. "
+                    "Workspace growth is not allowed after locking."
                 )
 
             # Only resize the requesting ubatch's workspace.  Other
