@@ -277,7 +277,21 @@ class Worker(WorkerBase):
             # ("Module has no function 'main'"). Make the cache per-rank
             # before anything imports tilelang. Idempotent across repeat
             # init_device calls.
-            for _cache_var in ("TILELANG_CACHE_DIR", "TILELANG_TMP_DIR"):
+            # Same race class exists for every other JIT cache the
+            # launcher points at node-shared storage: Triton, DeepGEMM,
+            # CUTE-DSL, torch-inductor and torch extensions all cold-
+            # compile per-shape artifacts from 4 worker processes at
+            # once (observed: Triton _pack_seq_kernel JIT immediately
+            # preceding a CUDA invalid-argument death on a cold node).
+            for _cache_var in (
+                "TILELANG_CACHE_DIR",
+                "TILELANG_TMP_DIR",
+                "TRITON_CACHE_DIR",
+                "DG_JIT_CACHE_DIR",
+                "CUTE_DSL_CACHE_DIR",
+                "TORCHINDUCTOR_CACHE_DIR",
+                "TORCH_EXTENSIONS_DIR",
+            ):
                 _base = os.environ.get(_cache_var)
                 if _base and not _base.endswith(f"rank{self.local_rank}"):
                     os.environ[_cache_var] = os.path.join(
