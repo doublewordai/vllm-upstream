@@ -1892,10 +1892,20 @@ class DPEngineCoreProc(EngineCoreProc):
             if not self.engines_running:
                 if envs.VLLM_DP_TRACE:
                     counts = self.scheduler.get_request_counts()
+                    # Wave-drop forensics: if outputs are still queued (or
+                    # requests still tracked) at sleep time, the engine is
+                    # going to sleep with undelivered work — the lost-output
+                    # window the api-server stream tasks then hang on.
+                    try:
+                        _oq = self.output_queue.qsize()
+                    except Exception:
+                        _oq = -1
                     logger.info(
-                        "[dp-trace] SLEEP wave=%d step=%d waiting=%d running=%d",
+                        "[dp-trace] SLEEP wave=%d step=%d waiting=%d running=%d "
+                        "outputs_queued=%d tracked_reqs=%d",
                         self.current_wave, self.step_counter,
-                        counts[0], counts[1],
+                        counts[0], counts[1], _oq,
+                        len(self.scheduler.requests),
                     )
                 # Force-publish a paused marker (bypassing the changed-counts
                 # check) so the coordinator can tell "asleep" apart from
