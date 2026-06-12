@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
+
+import vllm.envs as envs
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -1797,6 +1799,20 @@ class Scheduler(SchedulerInterface):
             request_ids = set(request_ids)
         else:
             request_ids = self.requests.keys()
+
+        # Wave-drop forensics: this is the only external removal path, and
+        # the 2026-06-12 episodes (in-flight requests silently discarded at
+        # a wave boundary, regenerated ~80s later) left no abort/preempt
+        # logs. Name every external finish while tracing.
+        if envs.VLLM_DP_TRACE and request_ids:
+            _ids = list(request_ids)
+            logger.info(
+                "[dp-trace] finish_requests status=%s n=%d sample=%s "
+                "(waiting=%d running=%d)",
+                finished_status, len(_ids), _ids[:3],
+                len(self.waiting) + len(self.skipped_waiting),
+                len(self.running),
+            )
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
