@@ -271,19 +271,6 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
-            # tilelang JIT caches to a directory shared by every worker
-            # process on the node; concurrent cold compiles of the same
-            # kernel race and a worker can load a torn module
-            # ("Module has no function 'main'"). Make the cache per-rank
-            # before anything imports tilelang. Idempotent across repeat
-            # init_device calls.
-            for _cache_var in ("TILELANG_CACHE_DIR", "TILELANG_TMP_DIR"):
-                _base = os.environ.get(_cache_var)
-                if _base and not _base.endswith(f"rank{self.local_rank}"):
-                    os.environ[_cache_var] = os.path.join(
-                        _base, f"rank{self.local_rank}"
-                    )
-
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking
