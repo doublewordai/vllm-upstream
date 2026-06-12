@@ -6457,6 +6457,30 @@ class GPUModelRunner(
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
 
+        # Over-cap visibility: if the scheduler can legally form a uniform
+        # decode batch larger than the largest captured graph, those steps
+        # fall to the eager path with workspace needs warmup never sized
+        # (served via the transient spill buffer, slowly). Surface the
+        # mismatch at boot so operators raise the capture cap or clamp
+        # max_num_seqs instead of discovering it under production load.
+        max_capture = self.compilation_config.max_cudagraph_capture_size or 0
+        max_decode_tokens = self.scheduler_config.max_num_seqs * (
+            1 + self.speculative_config.num_speculative_tokens
+            if self.speculative_config
+            else 1
+        )
+        if max_capture and max_decode_tokens > max_capture:
+            logger.warning(
+                "max_num_seqs allows uniform decode batches up to %d tokens "
+                "but the largest captured CUDA graph is %d: batches in "
+                "(%d, %d] will run EAGER with spill-buffer workspaces. "
+                "Raise cudagraph capture sizes or clamp max_num_seqs.",
+                max_decode_tokens,
+                max_capture,
+                max_capture,
+                max_decode_tokens,
+            )
+
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
