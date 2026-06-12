@@ -1860,6 +1860,25 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        # Wave-drop forensics: an episode cohort leaves waiting and finishes
+        # without ever being observed running. Log any request that finishes
+        # with fewer output tokens than it asked for — exactly the anomalous
+        # population, negligible volume in healthy runs.
+        if envs.VLLM_DP_TRACE:
+            _want = (
+                request.sampling_params.max_tokens
+                if request.sampling_params is not None
+                else None
+            )
+            _got = request.num_output_tokens
+            if _want is not None and _got < _want:
+                logger.info(
+                    "[dp-trace] SHORT-FINISH id=%s status=%s out=%d want=%d "
+                    "computed=%d prompt=%d",
+                    request.request_id, request.status, _got, _want,
+                    request.num_computed_tokens, request.num_prompt_tokens,
+                )
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
