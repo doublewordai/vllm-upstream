@@ -179,6 +179,10 @@ class SchedulerStats:
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
+    # True when the engine published this while entering the paused (idle)
+    # state. The DP coordinator uses it to detect engines asleep while work
+    # exists elsewhere in the group (a lost wake-up).
+    engines_paused: bool = False
 
     kv_cache_usage: float = 0.0
 
