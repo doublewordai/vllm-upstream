@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -12,6 +13,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     _make_metadata_with_slice,
+    is_last_ubatch_empty,
     maybe_create_ubatch_slices,
     slice_query_start_locs,
     split_attn_metadata,
@@ -76,6 +78,22 @@ def test_slice_bounds_edge_cases(sample_query_start_loc):
 
     expected = torch.tensor([0, 15])
     assert torch.equal(result, expected)
+
+
+def test_zero_tokens_per_ubatch_is_empty():
+    assert is_last_ubatch_empty(orig_num_tokens=1, padded_num_tokens=1, num_ubatches=2)
+
+
+def test_degenerate_ubatch_slice_raises():
+    with pytest.raises(RuntimeError, match="Degenerate ubatch slice"):
+        maybe_create_ubatch_slices(
+            True,
+            np.array([1], dtype=np.int32),
+            num_tokens_padded=1,
+            num_reqs_padded=1,
+            num_ubatches=2,
+            split_point=0,
+        )
 
 
 @pytest.fixture
