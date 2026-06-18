@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
+    VLLM_API_SOCKET_PER_WORKER: bool = False
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
@@ -769,6 +770,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # timeout for each iteration in the engine
     "VLLM_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
         os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")
+    ),
+    # Give each API server worker its own SO_REUSEPORT listen socket so the
+    # kernel hash-balances incoming connections across workers, instead of
+    # all workers accepting from one shared socket (epoll wakeup order can
+    # send >40% of a connection burst to a single worker).
+    "VLLM_API_SOCKET_PER_WORKER": lambda: bool(
+        int(os.getenv("VLLM_API_SOCKET_PER_WORKER", "0"))
     ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).

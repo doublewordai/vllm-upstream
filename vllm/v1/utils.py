@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import socket
 import threading
 import time
 import weakref
@@ -466,6 +467,22 @@ def run_api_server_worker_proc(
 
     client_config = client_config or {}
     server_index = client_config.get("client_index", 0)
+
+    if (
+        envs.VLLM_API_SOCKET_PER_WORKER
+        and sock is not None
+        and sock.family in (socket.AF_INET, socket.AF_INET6)
+        and client_config.get("client_count", 1) > 1
+    ):
+        # Replace this worker's dup of the shared listen socket with its own
+        # SO_REUSEPORT socket; the kernel then spreads new connections evenly
+        # across workers. The inherited socket stays bound (never listening)
+        # in the parent, so it keeps the port reserved but takes no traffic.
+        from vllm.entrypoints.openai.api_server import create_server_socket
+
+        bound = sock.getsockname()
+        sock.close()
+        sock = create_server_socket((bound[0], bound[1]))
 
     # Set process title and add process-specific prefix to stdout and stderr.
     set_process_title("APIServer", str(server_index))
