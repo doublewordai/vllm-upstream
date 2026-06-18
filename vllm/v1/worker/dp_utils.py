@@ -9,7 +9,7 @@ from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
-    is_last_ubatch_empty,
+    has_empty_ubatch,
 )
 
 logger = init_logger(__name__)
@@ -62,11 +62,11 @@ def _post_process_ubatch(tensor: torch.Tensor, num_ubatches: int) -> bool:
     should_ubatch: bool = bool(torch.all(tensor[2] == 1).item())
     if not should_ubatch:
         return False
-    # If the DP ranks are planning to ubatch, make sure that
-    # there are no "empty" second ubatches
+    # If the DP ranks are planning to ubatch, make sure every microbatch
+    # has at least one real token.
     orig_min_num_tokens = int(orig_num_tokens_tensor.min().item())
     padded_max_num_tokens = int(padded_num_tokens_tensor.max().item())
-    if is_last_ubatch_empty(orig_min_num_tokens, padded_max_num_tokens, num_ubatches):
+    if has_empty_ubatch(orig_min_num_tokens, padded_max_num_tokens, num_ubatches):
         logger.debug(
             "Aborting ubatching %s %s", orig_min_num_tokens, padded_max_num_tokens
         )

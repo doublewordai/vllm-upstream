@@ -480,9 +480,9 @@ def split_decodes_prefills_and_extends(
         num_extend_tokens: The number of tokens in the extend requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
     """
-    max_query_len = common_attn_metadata.max_query_len
-    num_reqs = common_attn_metadata.num_reqs
-    num_tokens = common_attn_metadata.num_actual_tokens
+    max_query_len = int(common_attn_metadata.max_query_len)
+    num_reqs = int(common_attn_metadata.num_reqs)
+    num_tokens = int(common_attn_metadata.num_actual_tokens)
     query_start_loc = common_attn_metadata.query_start_loc_cpu
     # Upper bound is exact for prefill rows; decode rows still satisfy
     # seq_len > query_len under the optimistic bound, so `seq_lens ==
@@ -496,10 +496,10 @@ def split_decodes_prefills_and_extends(
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     is_prefill_or_extend = query_lens > decode_threshold
     is_prefill = (seq_lens == query_lens) & is_prefill_or_extend
-    first_extend = is_prefill_or_extend.int().argmax(dim=-1).item()
-    first_prefill = is_prefill.int().argmax(dim=-1).item()
+    first_extend = int(is_prefill_or_extend.int().argmax(dim=-1).item())
+    first_prefill = int(is_prefill.int().argmax(dim=-1).item())
     num_decodes = first_extend
-    num_decode_tokens = query_start_loc[first_extend].item()
+    num_decode_tokens = int(query_start_loc[first_extend].item())
     if not torch.any(is_prefill_or_extend):
         return (num_decodes, 0, 0, num_decode_tokens, 0, 0)
 
@@ -518,8 +518,8 @@ def split_decodes_prefills_and_extends(
     num_extends = first_prefill - num_decodes
     num_prefills = num_reqs - first_prefill
 
-    num_prefill_tokens = num_tokens - query_start_loc[first_prefill]
-    num_extend_tokens = num_prefill_or_extend_tokens - num_prefill_tokens
+    num_prefill_tokens = int(num_tokens - query_start_loc[first_prefill].item())
+    num_extend_tokens = int(num_prefill_or_extend_tokens - num_prefill_tokens)
     return (
         num_decodes,
         num_extends,
@@ -560,9 +560,9 @@ def split_decodes_and_prefills(
         num_decode_tokens: The number of tokens in the decode requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
     """
-    max_query_len = common_attn_metadata.max_query_len
-    num_reqs = common_attn_metadata.num_reqs
-    num_tokens = common_attn_metadata.num_actual_tokens
+    max_query_len = int(common_attn_metadata.max_query_len)
+    num_reqs = int(common_attn_metadata.num_reqs)
+    num_tokens = int(common_attn_metadata.num_actual_tokens)
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
     if (
@@ -594,11 +594,11 @@ def split_decodes_and_prefills(
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
 
-    first_prefill = is_prefill.int().argmax(dim=-1).item()
+    first_prefill = int(is_prefill.int().argmax(dim=-1).item())
     num_decodes = first_prefill
     num_prefills = num_reqs - num_decodes
-    num_decode_tokens = query_start_loc[first_prefill].item()
-    num_prefill_tokens = num_tokens - num_decode_tokens
+    num_decode_tokens = int(query_start_loc[first_prefill].item())
+    num_prefill_tokens = int(num_tokens - num_decode_tokens)
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 

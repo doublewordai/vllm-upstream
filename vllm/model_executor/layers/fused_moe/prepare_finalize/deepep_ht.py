@@ -5,7 +5,13 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -65,8 +71,67 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # micro-batch to avoid races between threads.
         self.handles = [None, None]
 
+        # Lamport-clock counters for host-issued dispatch/combine calls,
+        # reported in the timeout annotations below. Healthy EP ranks
+        # advance these in lockstep (graph REPLAYS bump no rank's counter
+        # since no Python runs, and the runtime mode is synced across DP
+        # ranks per step), so on a collective timeout, comparing values
+        # across ranks' logs separates "all ranks in the same stuck
+        # collective" (transport) from "ranks in different collectives"
+        # (scheduling desync) — and seq mod num-moe-layers localizes the
+        # layer.
+        self.dispatch_seq = 0
+        self.combine_seq = 0
+
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
+
+    def _step_debug(self) -> str:
+        try:
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                return (
+                    f"mode={ctx.cudagraph_runtime_mode} "
+                    f"descriptor={ctx.batch_descriptor}"
+                )
+        except Exception:
+            pass
+        return "no-forward-context"
+
+    def _num_worst_tokens(self, tokens: torch.Tensor) -> int:
+        """Worst-case recv size for CUDA-graph-safe dispatch.
+
+        When non-zero, dispatch skips its host count sync, returns
+        worst-case-padded recv tensors with per-expert counts in a device
+        tensor, and the dispatch+combine round trip becomes
+        stream-capturable (requires the UCCL ht-cudagraph-worst-tokens
+        kernels).
+
+        Sized from the dispatched tensor itself: DP padding makes its row
+        count uniform across ranks, so it equals the step's padded token
+        count for whole-batch steps and this microbatch's padded slice
+        under DBO ubatching (the forward context's batch descriptor covers
+        the whole step there, which would oversize ubatch recv buffers 2x).
+        Eager steps (prefill, mixed, uncaptured shapes) return 0 and keep
+        the host-synced path — no padding overhead where there is no graph
+        to serve."""
+        if not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH:
+            return 0
+        if not is_forward_context_available():
+            return 0
+        ctx = get_forward_context()
+        # UBatchWrapper passes cudagraph_runtime_mode=NONE into the
+        # per-ubatch forward contexts while CAPTURING a full ubatched
+        # graph, so the context mode alone misses exactly the case that
+        # must not record the host-synced protocol (its CPU poll waits on
+        # a kernel that never executes under capture). Check the stream's
+        # capture status directly as well.
+        if (
+            ctx.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return 0
+        return tokens.size(0) * self.num_dispatchers_
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -136,15 +201,18 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
-        (
-            token_data,
-            expert_topk_ids,
-            expert_topk_weights,
-            expert_num_tokens_per_expert_list,
-            handle,
-            event,
-        ) = self.buffer.dispatch(
-            x=token_data,
+        num_worst_tokens = self._num_worst_tokens(tokens)
+        self.dispatch_seq += 1
+        try:
+            (
+                token_data,
+                expert_topk_ids,
+                expert_topk_weights,
+                expert_num_tokens_per_expert_list,
+                handle,
+                event,
+            ) = self.buffer.dispatch(
+                x=token_data,
             handle=None,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -154,12 +222,29 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             topk_weights=rank_topk_weights,
             # expert_alignment rounds the number of tokens per expert
             # to this value.
-            expert_alignment=1,
-            config=self._get_dispatch_config(),
-            previous_event=previous_event,
-            async_finish=self.async_prepare and not dbo_enabled(),
-            allocate_on_comm_stream=False,
-        )
+                expert_alignment=1,
+                num_worst_tokens=num_worst_tokens,
+                config=self._get_dispatch_config(),
+                previous_event=previous_event,
+                # With worst-token graphs in play, ALL dispatches must join
+                # back to the compute stream: a graph replay launched on the
+                # compute stream does not wait on the live comm stream, so an
+                # async eager dispatch still in flight would race the captured
+                # dispatch kernels on the shared ring buffers.
+                async_finish=(
+                    self.async_prepare
+                    and not dbo_enabled()
+                    and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH
+                ),
+                allocate_on_comm_stream=False,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc} [deepep-ht dispatch debug: "
+                f"seq={self.dispatch_seq} ubatch={dbo_current_ubatch_id()} "
+                f"tokens={tokens.shape[0]} worst={num_worst_tokens} "
+                f"{self._step_debug()}]"
+            ) from exc
 
         # record the handle for this ubatch
         a2a_idx = dbo_current_ubatch_id()
@@ -187,7 +272,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         token_data: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
         expert_topk_ids: torch.Tensor | None,
         num_experts: int,
-        expert_num_tokens_per_expert_list: list[int],
+        expert_num_tokens_per_expert_list: list[int] | torch.Tensor,
         expert_topk_weights: torch.Tensor | None,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
@@ -219,12 +304,21 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_topk_ids + self.rank_expert_offset,
         )
 
-        # Makes a GPU-CPU copy.
-        # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
-        # on GPU.
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_per_expert_list, device=expert_x.device
-        )
+        if isinstance(expert_num_tokens_per_expert_list, torch.Tensor):
+            # Worst-token (CUDA-graph) dispatch: counts arrive as a device
+            # tensor written by the notify kernel; no host copy exists and
+            # none may be made on this path.
+            expert_tokens_meta = mk.ExpertTokensMetadata(
+                expert_num_tokens=expert_num_tokens_per_expert_list,
+                expert_num_tokens_cpu=None,
+            )
+        else:
+            # Makes a GPU-CPU copy.
+            # TODO (varun): Maybe it is better to re-compute the
+            # expert_num_tokens on GPU.
+            expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
+                expert_num_tokens_per_expert_list, device=expert_x.device
+            )
 
         # * For non-block quant, dispatch in b16 and quantize now as
         #   DeepEP kernels only support dispatching block scales.
@@ -364,16 +458,28 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
-        combined_x, _, event = self.buffer.combine(
+        self.combine_seq += 1
+        try:
+            combined_x, _, event = self.buffer.combine(
             # HT combine only supports BF16
             x=fused_expert_output,
             handle=handle,
             topk_weights=None,
             config=self._get_combine_config(),
             previous_event=previous_event,
-            async_finish=do_async and not dbo_enabled(),
+            # Same ring-race hazard as dispatch: combine's comm-stream work
+            # must be joined before a subsequent graph replay can launch.
+            async_finish=do_async
+            and not dbo_enabled()
+            and not envs.VLLM_DEEPEP_HT_WORST_TOKEN_DISPATCH,
             allocate_on_comm_stream=False,
-        )
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc} [deepep-ht combine debug: "
+                f"seq={self.combine_seq} ubatch={dbo_current_ubatch_id()} "
+                f"tokens={fused_expert_output.shape[0]} {self._step_debug()}]"
+            ) from exc
 
         dbo_switch_to_compute()
 
