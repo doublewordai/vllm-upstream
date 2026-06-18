@@ -32,7 +32,10 @@ UBatchSlices: TypeAlias = list[UBatchSlice]
 def is_last_ubatch_empty(
     orig_num_tokens: int, padded_num_tokens: int, num_ubatches: int
 ) -> bool:
-    return (padded_num_tokens // num_ubatches) * (num_ubatches - 1) >= orig_num_tokens
+    tokens_per_ubatch = padded_num_tokens // num_ubatches
+    if tokens_per_ubatch == 0:
+        return True
+    return tokens_per_ubatch * (num_ubatches - 1) >= orig_num_tokens
 
 
 def check_ubatch_thresholds(
@@ -66,14 +69,19 @@ def maybe_create_ubatch_slices(
     num_tokens_padded: int,
     num_reqs_padded: int,
     num_ubatches: int,
-    split_point: list[int] | int | None = None,
+    split_point: int | None = None,
 ) -> tuple[UBatchSlices | None, UBatchSlices | None]:
     if not should_ubatch:
         return None, None
 
-    if split_point is None:
-        split_point = int(num_tokens_padded) // num_ubatches
+    num_tokens_padded = int(num_tokens_padded)
+    num_reqs_padded = int(num_reqs_padded)
+    num_ubatches = int(num_ubatches)
 
+    if split_point is None:
+        split_point = num_tokens_padded // num_ubatches
+
+    split_point = int(split_point)
     token_split_points = [split_point * i for i in range(1, num_ubatches)]
 
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
@@ -85,9 +93,18 @@ def maybe_create_ubatch_slices(
     start_token = 0
 
     # Add the end point to the split points to make iteration easier
-    all_points = token_split_points + [cu_num_tokens[-1]]
+    all_points = token_split_points + [int(cu_num_tokens[-1])]
 
     for end_token in all_points:
+        end_token = int(end_token)
+        if end_token <= start_token:
+            raise RuntimeError(
+                "Degenerate ubatch slice after ubatching was selected: "
+                f"start_token={start_token}, end_token={end_token}, "
+                f"num_tokens_padded={num_tokens_padded}, "
+                f"split_points={token_split_points}, "
+                f"cu_num_tokens[-1]={int(cu_num_tokens[-1])}"
+            )
         token_slice = slice(start_token, end_token)
 
         # Determine request slices using exclusive stop semantics
@@ -103,7 +120,7 @@ def maybe_create_ubatch_slices(
         req_slice = slice(req_start, req_stop)
         ubatch_slices.append(UBatchSlice(req_slice, token_slice))
 
-        start_token = end_token
+        start_token = int(end_token)
 
     ubatch_slices_padded = _pad_out_ubatch_slices(
         ubatch_slices, num_tokens_padded, num_reqs_padded
