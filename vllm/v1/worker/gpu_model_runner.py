@@ -4566,9 +4566,13 @@ class GPUModelRunner(
                     ].clone(),
                 )
 
+            # Full CUDA graph replay can reuse sampler output storage before
+            # the copy stream finishes the async D2H copy.
+            sampled_token_ids_snapshot = sampler_output.sampled_token_ids.clone()
+
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
-                sampled_token_ids=sampler_output.sampled_token_ids,
+                sampled_token_ids=sampled_token_ids_snapshot,
                 logprobs_tensors=sampler_output.logprobs_tensors,
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
