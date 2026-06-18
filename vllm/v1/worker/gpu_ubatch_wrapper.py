@@ -294,17 +294,22 @@ class UBatchWrapper:
 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
-        def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
-            results.append((ubatch_metadata.context.id, model_output))
+        def _ubatch_thread(results, errors, model, metadata):
+            try:
+                with metadata.context:
+                    model_output = model(
+                        input_ids=metadata.input_ids,
+                        positions=metadata.positions,
+                        intermediate_tensors=metadata.intermediate_tensors,
+                        inputs_embeds=metadata.inputs_embeds,
+                    )
+                results.append((metadata.context.id, model_output))
+            except BaseException as exc:
+                errors.append(exc)
+                self.ready_barrier.abort()
 
         results: list[tuple[int, torch.Tensor]] = []
+        errors: list[BaseException] = []
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
@@ -316,16 +321,48 @@ class UBatchWrapper:
                     target=_ubatch_thread,
                     args=(
                         results,
+                        errors,
                         model,
                         metadata,
                     ),
                 )
                 ubatch_threads.append(thread)
                 thread.start()
-            self.ready_barrier.wait()  # Wait for both threads to be ready
-            ubatch_metadata[0].context.cpu_wait_event.set()
-            for thread in ubatch_threads:
-                thread.join()
+            barrier_error = None
+            try:
+                self.ready_barrier.wait()  # Wait for both threads to be ready
+                ubatch_metadata[0].context.cpu_wait_event.set()
+            except threading.BrokenBarrierError as exc:
+                barrier_error = exc
+            finally:
+                for thread in ubatch_threads:
+                    while thread.is_alive():
+                        thread.join(timeout=1)
+                        if errors or barrier_error is not None:
+                            break
+                if errors or barrier_error is not None:
+                    for metadata in ubatch_metadata:
+                        metadata.context.cpu_wait_event.set()
+                    for thread in ubatch_threads:
+                        thread.join(timeout=30)
+
+        stuck = [t.name for t in ubatch_threads if t.is_alive()]
+        if stuck:
+            raise RuntimeError(
+                f"DBO ubatch thread(s) {stuck} failed to unwind after a peer "
+                "error; a thread is likely blocked inside a CUDA call."
+            ) from (errors[0] if errors else barrier_error)
+        if errors:
+            raise RuntimeError("DBO ubatch execution failed") from errors[0]
+        if barrier_error is not None:
+            raise RuntimeError("DBO ubatch execution did not reach the barrier") from (
+                barrier_error
+            )
+        if len(results) != len(ubatch_metadata):
+            raise RuntimeError(
+                "DBO ubatch execution produced incomplete outputs: "
+                f"got {len(results)} of {len(ubatch_metadata)} ubatches"
+            )
         sorted_results = [value for position, value in sorted(results)]
         result = _cat_ubatch_outputs(sorted_results)
         return result
