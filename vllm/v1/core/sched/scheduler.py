@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
+
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -1798,6 +1800,18 @@ class Scheduler(SchedulerInterface):
         else:
             request_ids = self.requests.keys()
 
+        # DP wave tracing: name external finishes so abort/disconnect paths
+        # are visible when diagnosing dropped or short-lived requests.
+        if envs.VLLM_DP_TRACE and request_ids:
+            _ids = list(request_ids)
+            logger.info(
+                "[dp-trace] finish_requests status=%s n=%d sample=%s "
+                "(waiting=%d running=%d)",
+                finished_status, len(_ids), _ids[:3],
+                len(self.waiting) + len(self.skipped_waiting),
+                len(self.running),
+            )
+
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
         valid_requests = []
@@ -1843,6 +1857,23 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # DP wave tracing: short finishes are low-volume in healthy runs and
+        # identify requests that left the scheduler before reaching max_tokens.
+        if envs.VLLM_DP_TRACE:
+            _want = (
+                request.sampling_params.max_tokens
+                if request.sampling_params is not None
+                else None
+            )
+            _got = request.num_output_tokens
+            if _want is not None and _got < _want:
+                logger.info(
+                    "[dp-trace] SHORT-FINISH id=%s status=%s out=%d want=%d "
+                    "computed=%d prompt=%d",
+                    request.request_id, request.status, _got, _want,
+                    request.num_computed_tokens, request.num_prompt_tokens,
+                )
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
