@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +12,6 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
     DPMetadata,
@@ -26,7 +26,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.worker.sm_control import (
+    get_all2all_manager_for_sm_control,
+    get_ubatch_comm_sms,
+)
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm.v1.worker.ubatch_utils import ensure_tensor_alignment
 
 logger = init_logger(__name__)
 
@@ -139,6 +144,37 @@ class UBatchWrapper:
         self.device = device
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+        self._mode_counts = {
+            "ubatched_replay": 0,
+            "ubatched_eager": 0,
+            "ubatched_capture": 0,
+            "plain_eager": 0,
+            "plain_graph": 0,
+        }
+        self._mode_last_log = time.monotonic()
+
+    _MODE_LOG_INTERVAL_S = 30.0
+
+    def _count_mode(self, mode: str) -> None:
+        self._mode_counts[mode] += 1
+        now = time.monotonic()
+        if now - self._mode_last_log < self._MODE_LOG_INTERVAL_S:
+            return
+
+        self._mode_last_log = now
+        counts = self._mode_counts
+        logger.info(
+            "[tbo-modes] last %ds: ubatched_replay=%d ubatched_eager=%d "
+            "ubatched_capture=%d plain_eager=%d plain_graph=%d",
+            int(self._MODE_LOG_INTERVAL_S),
+            counts["ubatched_replay"],
+            counts["ubatched_eager"],
+            counts["ubatched_capture"],
+            counts["plain_eager"],
+            counts["plain_graph"],
+        )
+        for key in counts:
+            counts[key] = 0
 
     @property
     def graph_pool(self):
@@ -153,25 +189,14 @@ class UBatchWrapper:
 
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
-        comm_sms: int = envs.VLLM_DBO_COMM_SMS
+        device = torch.accelerator.current_device_index()
+        total_sms = num_compute_units(device)
+        all2all_manager = get_all2all_manager_for_sm_control(vllm_config)
+        comm_sms = get_ubatch_comm_sms(vllm_config, total_sms, all2all_manager)
 
         set_comm_sms = lambda sms: None
-        if vllm_config.parallel_config.enable_expert_parallel:
-            # Currently only DeepEP highthroughput supports SM control so this
-            # only affects that case.
-            ep_group = get_ep_group()
-            device_communicator = ep_group.device_communicator
-            all2all_manager = None
-            if device_communicator is not None:
-                all2all_manager = device_communicator.all2all_manager
-
-            if all2all_manager is not None:
-                max_sms_used = all2all_manager.max_sms_used()
-                if max_sms_used is not None:
-                    comm_sms = min(comm_sms, max_sms_used)
-
-            if comm_sms > 0 and all2all_manager is not None:
-                set_comm_sms = lambda sms: all2all_manager.set_num_sms(sms)
+        if comm_sms > 0 and all2all_manager is not None:
+            set_comm_sms = lambda sms: all2all_manager.set_num_sms(sms)
 
         # TODO(lucas): support other kernels besides DeepGEMM
         set_compute_sms = lambda sms: None
@@ -343,6 +368,7 @@ class UBatchWrapper:
         dp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
+        for_capture: bool = False,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
@@ -382,6 +408,7 @@ class UBatchWrapper:
                 positions,
                 inputs_embeds,
                 intermediate_tensors,
+                allow_clone=not for_capture,
             )
             ubatch_metadata.append(
                 UbatchMetadata(
@@ -404,14 +431,23 @@ class UBatchWrapper:
         positions,
         inputs_embeds,
         intermediate_tensors,
+        allow_clone: bool = True,
     ):
-        sliced_input_ids = input_ids[tokens_slice] if input_ids is not None else None
+        sliced_input_ids = (
+            ensure_tensor_alignment(input_ids[tokens_slice], allow_clone=allow_clone)
+            if input_ids is not None
+            else None
+        )
         # if we are using mrope. Mrope adds an additional dimension to the
         # positions tensor
         if positions.ndim == 2:
             sliced_positions = positions[:, tokens_slice]
         else:
             sliced_positions = positions[tokens_slice]
+        sliced_positions = ensure_tensor_alignment(
+            sliced_positions,
+            allow_clone=allow_clone,
+        )
         sliced_inputs_embeds = (
             inputs_embeds[tokens_slice] if inputs_embeds is not None else None
         )
@@ -447,11 +483,17 @@ class UBatchWrapper:
                 if batch_descriptor.num_tokens in self.cudagraphs:
                     cudagraph_runtime_mode = CUDAGraphMode.NONE
 
-            if cudagraph_runtime_mode in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
-                return self.runnable(*args, **kwargs)
-            else:
-                assert self.cudagraph_wrapper is not None
-                return self.cudagraph_wrapper(*args, **kwargs)
+            with self.sm_control:
+                if cudagraph_runtime_mode in (
+                    CUDAGraphMode.NONE,
+                    CUDAGraphMode.PIECEWISE,
+                ):
+                    self._count_mode("plain_eager")
+                    return self.runnable(*args, **kwargs)
+                else:
+                    assert self.cudagraph_wrapper is not None
+                    self._count_mode("plain_graph")
+                    return self.cudagraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata
         slot_mapping = forward_context.slot_mapping
@@ -496,7 +538,9 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                for_capture=True,
             )
+            self._count_mode("ubatched_capture")
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.runnable)
         elif (
@@ -507,6 +551,7 @@ class UBatchWrapper:
             # Sync offloader before replay - ensures any external dependencies
             # from pre-capture prefetches are satisfied.
             get_offloader().sync_prev_onload()
+            self._count_mode("ubatched_replay")
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:
@@ -523,5 +568,6 @@ class UBatchWrapper:
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
+            self._count_mode("ubatched_eager")
             with self.sm_control:
                 return self._run_ubatches(ubatch_metadata, self.runnable)
