@@ -34,6 +34,7 @@ class NixlKVConnectorStats(KVConnectorStats):
         # Must be serializable
         self.data: dict[str, list[float | int]] = {
             "transfer_duration": [],
+            "wall_duration": [],
             "post_duration": [],
             "bytes_transferred": [],
             "num_descriptors": [],
@@ -42,9 +43,16 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_kv_expired_reqs": [],
         }
 
-    def record_transfer(self, res: "nixlXferTelemetry"):
+    def record_transfer(
+        self, res: "nixlXferTelemetry", wall_duration: float | None = None
+    ):
         # Keep metrics units consistent with rest of the code: time us->s
         self.data["transfer_duration"].append(res.xferDuration / 1e6)
+        # Wall-clock post->completion-observed time. Falls back to the
+        # NIXL-internal duration so the list stays aligned with the others.
+        self.data["wall_duration"].append(
+            wall_duration if wall_duration is not None else res.xferDuration / 1e6
+        )
         self.data["post_duration"].append(res.postDuration / 1e6)
         self.data["bytes_transferred"].append(res.totalBytes)
         self.data["num_descriptors"].append(res.descCount)
@@ -92,6 +100,8 @@ class NixlKVConnectorStats(KVConnectorStats):
                 "Num successful transfers": 0,
                 "Avg xfer time (ms)": 0,
                 "P90 xfer time (ms)": 0,
+                "Avg xfer wall time (ms)": 0,
+                "P90 xfer wall time (ms)": 0,
                 "Avg post time (ms)": 0,
                 "P90 post time (ms)": 0,
                 "Avg MB per transfer": 0,
@@ -100,6 +110,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             }
 
         xfer_time = np.asarray(self.data["transfer_duration"])
+        wall_time = np.asarray(self.data["wall_duration"])
         post_time = np.asarray(self.data["post_duration"])
         # Convert to MB for CLI logging.
         mb = np.asarray(self.data["bytes_transferred"]) / 2**20
@@ -117,6 +128,10 @@ class NixlKVConnectorStats(KVConnectorStats):
             "Num successful transfers": n,
             "Avg xfer time (ms)": round(xfer_time.mean() * 1e3, 3),
             "P90 xfer time (ms)": round(np.percentile(xfer_time, 90).item() * 1e3, 3),
+            "Avg xfer wall time (ms)": round(wall_time.mean() * 1e3, 3),
+            "P90 xfer wall time (ms)": round(
+                np.percentile(wall_time, 90).item() * 1e3, 3
+            ),
             "Avg post time (ms)": round(post_time.mean() * 1e3, 3),
             "P90 post time (ms)": round(np.percentile(post_time, 90).item() * 1e3, 3),
             "Avg MB per transfer": round(avg_mb, 3),
@@ -162,6 +177,20 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
         self.nixl_histogram_xfer_time = create_metric_per_engine(
             nixl_histogram_xfer_time, self.per_engine_labelvalues
+        )
+        # End-to-end wait buckets are much wider than the raw transfer-time
+        # buckets: this metric includes engine/backend queueing, which is
+        # exactly where transport pathologies show up (tens of seconds).
+        wall_buckets = buckets + [2.0, 10.0, 30.0, 60.0]
+        nixl_histogram_xfer_wall_time = self._histogram_cls(
+            name="vllm:nixl_xfer_wall_time_seconds",
+            documentation="Histogram of wall-clock time from transfer post to "
+            "completion observed, for NIXL KV Cache transfers.",
+            buckets=wall_buckets,
+            labelnames=labelnames,
+        )
+        self.nixl_histogram_xfer_wall_time = create_metric_per_engine(
+            nixl_histogram_xfer_wall_time, self.per_engine_labelvalues
         )
         nixl_histogram_post_time = self._histogram_cls(
             name="vllm:nixl_post_time_seconds",
@@ -241,12 +270,14 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         for prom_obj, list_item_key in zip(
             [
                 self.nixl_histogram_xfer_time,
+                self.nixl_histogram_xfer_wall_time,
                 self.nixl_histogram_post_time,
                 self.nixl_histogram_bytes_transferred,
                 self.nixl_histogram_num_descriptors,
             ],
             [
                 "transfer_duration",
+                "wall_duration",
                 "post_duration",
                 "bytes_transferred",
                 "num_descriptors",
