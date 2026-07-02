@@ -219,6 +219,16 @@ class NixlConnectorWorker:
         kv_lease_duration: int = vllm_config.kv_transfer_config.get_from_extra_config(
             "kv_lease_duration", 30
         )
+        # Timeout for the side-channel metadata handshake with a remote agent.
+        # The default matches the previous hardcoded 5s, which is too short on
+        # some fabrics: agent metadata scales with the number of KV blocks
+        # (millions of descriptors for large KV pools), and shipping+decoding
+        # it cross-node can exceed 5s.
+        self._handshake_timeout_ms: int = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "handshake_timeout_ms", 5000
+            )
+        )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
 
@@ -513,7 +523,7 @@ class NixlConnectorWorker:
                 # Send query for the request.
                 msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                sock.setsockopt(zmq.RCVTIMEO, self._handshake_timeout_ms)
                 sock.send(msg)
                 handshake_bytes = sock.recv()
 
