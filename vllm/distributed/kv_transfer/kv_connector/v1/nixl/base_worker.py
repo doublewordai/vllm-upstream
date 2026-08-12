@@ -539,6 +539,12 @@ class NixlBaseConnectorWorker:
         # finish reading before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.xfer_stats = NixlKVConnectorStats()
+        # Wall-clock post time per in-flight transfer handle, used to report
+        # end-to-end transfer wait (post -> completion observed). Unlike the
+        # NIXL-internal xferDuration telemetry, this includes engine/backend
+        # queueing and completion-polling delay, i.e. what a request actually
+        # waits for its KV.
+        self._xfer_post_time: dict[int, float] = {}
 
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -2234,7 +2240,13 @@ class NixlBaseConnectorWorker:
                     if xfer_state == "DONE":
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
+                        post_ts = self._xfer_post_time.pop(handle, None)
+                        wall_duration = (
+                            time.perf_counter() - post_ts
+                            if post_ts is not None
+                            else None
+                        )
+                        self.xfer_stats.record_transfer(res, wall_duration)
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -2279,6 +2291,7 @@ class NixlBaseConnectorWorker:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
         if handle is not None:
+            self._xfer_post_time.pop(handle, None)
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 

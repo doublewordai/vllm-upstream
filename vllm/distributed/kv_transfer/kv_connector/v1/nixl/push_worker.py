@@ -664,6 +664,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 notif_msg=notif_id,
             )
             self.nixl_wrapper.transfer(handle)
+            self._xfer_post_time[handle] = time.perf_counter()
             # Caller tracks the handle (atomically with the request's other
             # writes) so P can free blocks once all of them are done.
             return handle
