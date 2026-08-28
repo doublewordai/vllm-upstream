@@ -77,19 +77,28 @@ def convert_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
     return w13, w2, w13_scale, w2_scale
 
 
+_kernels: dict = {}
+
+
+def _shared_kernel(transport, intermediate_size: int):
+    """One kernel object (activation slabs, flags, cubin) per geometry, shared by every MoE layer
+    of the process: the layers run one at a time and only the weights differ."""
+    key = (id(transport), intermediate_size, W13_FORMAT, W2_FORMAT)
+    if key not in _kernels:
+        from megakernel import Megakernel
+
+        _kernels[key] = Megakernel(
+            transport, intermediate_size, w2_format=W2_FORMAT, w13_format=W13_FORMAT
+        )
+    return _kernels[key]
+
+
 class MegakernelExperts(mk.FusedMoEExpertsModular):
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config, quant_config)
-        from megakernel import Megakernel
-
         manager = get_ep_group().device_communicator.all2all_manager
         transport = manager.get_handle(megakernel_transport_kwargs(moe_config))
-        self.kernel = Megakernel(
-            transport,
-            moe_config.intermediate_size_per_partition,
-            w2_format=W2_FORMAT,
-            w13_format=W13_FORMAT,
-        )
+        self.kernel = _shared_kernel(transport, moe_config.intermediate_size_per_partition)
         self.w13_sfq, self.w2_sfq = getattr(quant_config, "megakernel_sfq", (None, None))
         assert (self.w13_sfq is not None) == (W13_FORMAT == "mxfp4")
         assert (self.w2_sfq is not None) == (W2_FORMAT == "mxfp4")
