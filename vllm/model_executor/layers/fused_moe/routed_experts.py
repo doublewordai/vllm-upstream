@@ -1234,9 +1234,12 @@ class RoutedExperts(PluggableLayer):
         import os as _os
 
         _d = _os.environ.get("MOE_DUMP_DIR")
-        if _d and x.shape[0] > 1:
+        _layers = _os.environ.get("MOE_DUMP_LAYERS", "")
+        _lname = str(getattr(self, "layer_name", ""))
+        if (_d and x.shape[0] > 1 and not torch.cuda.is_current_stream_capturing()
+                and not bool((topk_ids < 0).all()) and (not _layers or any(f".layers.{l}." in _lname for l in _layers.split(",")))):
             _n = getattr(self, "_moe_dump_n", 0)
-            if _n < 2:
+            if _n < int(_os.environ.get("MOE_DUMP_MAX", "2")):
                 self._moe_dump_n = _n + 1
                 _os.makedirs(_d, exist_ok=True)
                 _rank = _os.environ.get("VLLM_DP_RANK", "0")
