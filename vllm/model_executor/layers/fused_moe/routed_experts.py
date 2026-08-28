@@ -1221,7 +1221,7 @@ class RoutedExperts(PluggableLayer):
         assert not self.quant_method.is_monolithic
 
         # Modular kernels use pre-computed routing
-        return self.quant_method.apply(
+        out = self.quant_method.apply(
             layer=self,
             x=x,
             topk_weights=topk_weights,
@@ -1229,6 +1229,25 @@ class RoutedExperts(PluggableLayer):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+        # Debug: MOE_DUMP_DIR=<dir> saves the first two calls' (x, topk, output) per layer on this rank
+        # for offline numerics comparison against a reference built from the checkpoint.
+        import os as _os
+
+        _d = _os.environ.get("MOE_DUMP_DIR")
+        if _d and x.shape[0] > 1:
+            _n = getattr(self, "_moe_dump_n", 0)
+            if _n < 2:
+                self._moe_dump_n = _n + 1
+                _os.makedirs(_d, exist_ok=True)
+                _rank = _os.environ.get("VLLM_DP_RANK", "0")
+                _o = out if isinstance(out, torch.Tensor) else out[0]
+                torch.save(
+                    {"x": x.detach().cpu(), "topk_ids": topk_ids.detach().cpu(),
+                     "topk_weights": topk_weights.detach().cpu(), "out": _o.detach().cpu(),
+                     "layer": getattr(self, "layer_name", "?")},
+                    f"{_d}/{str(getattr(self, 'layer_name', 'layer')).replace('/', '_')}_rank{_rank}_call{_n}.pt",
+                )
+        return out
 
     def forward_monolithic(
         self,
