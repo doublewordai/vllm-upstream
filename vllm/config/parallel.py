@@ -48,6 +48,7 @@ All2AllBackend = Literal[
     "mori_high_throughput",
     "mori_low_latency",
     "nixl_ep",
+    "megakernel",
     "allgather_reducescatter",
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
@@ -191,6 +192,8 @@ class ParallelConfig:
     - "allgather_reducescatter": All2all based on allgather and reducescatter
     - "deepep_high_throughput": Use deepep high-throughput kernels
     - "deepep_low_latency": Use deepep low-latency kernels
+    - "megakernel": one kernel per MoE layer that performs the dispatch, the
+      expert GEMMs and the combine over CXI (GH200 / Slingshot only)
     - "mori_high_throughput": MoRI EP with InterNodeV1 for multi-node
     - "mori_low_latency": MoRI EP with InterNodeV1LL for multi-node
     - "nixl_ep": Use nixl-ep kernels

@@ -1090,3 +1090,47 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             for _, handle in self.handle_cache._cache.items():
                 handle.destroy()
             self.handle_cache._cache.clear()
+
+
+class MegakernelAll2AllManager(All2AllManagerBase):
+    """Owns the megakernel's CXI transport (github.com/doublewordai/megakernel): one per
+    process, shared by every MoE layer.  Dispatch and combine run inside the MoE kernel, so
+    the manager's dispatch/combine methods are never called."""
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+        self._transport = None
+        self._transport_key = None
+
+    def get_handle(self, kwargs):
+        """kwargs: hidden_size, top_k, num_local_experts, max_tokens_per_rank."""
+        from megakernel import Transport
+
+        key = tuple(sorted(kwargs.items()))
+        if self._transport is None:
+            cpu_group = self.cpu_group
+
+            def all_gather(obj):
+                out = [None] * cpu_group.size()
+                dist.all_gather_object(out, obj, group=cpu_group)
+                return out
+
+            self._transport = Transport(
+                world_size=self.world_size,
+                rank=self.rank,
+                local_rank=torch.cuda.current_device(),
+                all_gather=all_gather,
+                **kwargs,
+            )
+            self._transport_key = key
+        elif key != self._transport_key:
+            raise ValueError(
+                f"megakernel transport built for {self._transport_key}, "
+                f"requested {key}"
+            )
+        return self._transport
+
+    def destroy(self):
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
