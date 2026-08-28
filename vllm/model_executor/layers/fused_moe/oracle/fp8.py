@@ -507,13 +507,14 @@ def convert_to_fp8_moe_kernel_format(
         w13.is_shuffled = True
         w2.is_shuffled = True
     elif fp8_backend == Fp8MoeBackend.MEGAKERNEL:
-        from megakernel import interleave_gate_up_inplace
+        from vllm.model_executor.layers.fused_moe.experts.megakernel_moe import (
+            convert_to_megakernel_format,
+        )
 
         assert block_quant
-        # gate/up rows interleaved per 128-row block so GEMM1 + SwiGLU works on one tile.
-        interleave_gate_up_inplace(w13, w13_scale)
-        w13_scale = w13_scale.contiguous().float()
-        w2_scale = w2_scale.contiguous().float()
+        w13, w2, w13_scale, w2_scale = convert_to_megakernel_format(
+            layer, w13, w2, w13_scale, w2_scale
+        )
     elif fp8_backend == Fp8MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,
