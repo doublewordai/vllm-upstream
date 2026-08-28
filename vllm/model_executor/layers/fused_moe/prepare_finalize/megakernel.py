@@ -63,17 +63,14 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             "the megakernel applies the router weights in the combine"
         )
         assert not defer_input_quant
-        block_shape = list(quant_config.block_shape) if quant_config.block_shape else None
-        assert quant_config.quant_dtype in (torch.float8_e4m3fn, "fp8") and block_shape == [128, 128], (
-            "the megakernel dispatches FP8 activations with per-128-group scales; got "
-            f"quant_dtype={quant_config.quant_dtype!r} block_shape={quant_config.block_shape!r}"
-        )
+        # The kernel dispatches fp8 activations with per-128-group scales whatever the expert
+        # weight format (fp8 block or MXFP4); the quant config only carries the weight scales.
         a1q, a1q_scale = moe_kernel_quantize_input(
             a1,
             None,
-            quant_dtype=quant_config.quant_dtype,
+            quant_dtype=torch.float8_e4m3fn,
             per_act_token_quant=False,
-            block_shape=quant_config.block_shape,
+            block_shape=[128, 128],
             is_scale_swizzled=False,
         )
         assert a1q_scale is not None

@@ -80,28 +80,68 @@ def convert_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
 _kernels: dict = {}
 
 
-def _shared_kernel(transport, intermediate_size: int):
+def _shared_kernel(transport, intermediate_size: int, w13_format: str, w2_format: str):
     """One kernel object (activation slabs, flags, cubin) per geometry, shared by every MoE layer
     of the process: the layers run one at a time and only the weights differ."""
-    key = (id(transport), intermediate_size, W13_FORMAT, W2_FORMAT)
+    key = (id(transport), intermediate_size, w13_format, w2_format)
     if key not in _kernels:
         from megakernel import Megakernel
 
         _kernels[key] = Megakernel(
-            transport, intermediate_size, w2_format=W2_FORMAT, w13_format=W13_FORMAT
+            transport, intermediate_size, w2_format=w2_format, w13_format=w13_format
         )
     return _kernels[key]
 
 
+def _unpack_nibbles(w: torch.Tensor) -> torch.Tensor:
+    """MXFP4 [.., K/2] uint8 (element 2j in the low nibble) -> codes [.., K] uint8."""
+    return torch.stack((w & 0x0F, w >> 4), dim=-1).reshape(*w.shape[:-1], w.shape[-1] * 2)
+
+
+def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor):
+    """[G, N, K] E2M1 codes + [G, N, K/32] E8M0 -> the kernel's packed MXFP4 (bq, sfq, sfb), no
+    re-quantization: only the per-expert exponent clamp of megakernel.weights.pack_mxfp4."""
+    from megakernel.weights import pack_mxfp4
+
+    G, N, K = codes.shape
+    bq = torch.empty((G, N // 2, K), dtype=torch.uint8, device=codes.device)
+    sfq = torch.empty((G, K // 128, N, 4), dtype=torch.uint8, device=codes.device)
+    sfb = torch.empty((G, N // 128, K // 128), dtype=torch.float32, device=codes.device)
+    for g in range(G):
+        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes[g], e8m0[g])
+    return bq, sfq, sfb
+
+
+def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
+    """MXFP4 checkpoint experts (vLLM layout: [G, N, K/2] packed nibbles, [G, N, K/32] E8M0 as
+    uint8) -> the kernel's packed format, gate/up rows interleaved per 128-row block.  Returns
+    (w13, w2, w13_scale, w2_scale) with the block scales as fp32; residual exponents on the layer."""
+    c13 = _unpack_nibbles(w13.data)
+    e13 = w13_scale.data.view(torch.uint8)
+    I = c13.shape[1] // 2
+    il = torch.empty_like(c13); il[:, 0::2] = c13[:, :I]; il[:, 1::2] = c13[:, I:]
+    ie = torch.empty_like(e13); ie[:, 0::2] = e13[:, :I]; ie[:, 1::2] = e13[:, I:]
+    w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie)
+    w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(_unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8))
+    return w13, w2, w13_scale, w2_scale
+
+
 class MegakernelExperts(mk.FusedMoEExpertsModular):
+    """fp8 block-quantized experts (optionally re-quantized to MXFP4 at load, see the module doc)."""
+
+    w13_format = W13_FORMAT
+    w2_format = W2_FORMAT
+
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config, quant_config)
         manager = get_ep_group().device_communicator.all2all_manager
         transport = manager.get_handle(megakernel_transport_kwargs(moe_config))
-        self.kernel = _shared_kernel(transport, moe_config.intermediate_size_per_partition)
+        self.kernel = _shared_kernel(
+            transport, moe_config.intermediate_size_per_partition, self.w13_format, self.w2_format
+        )
         self.w13_sfq, self.w2_sfq = getattr(quant_config, "megakernel_sfq", (None, None))
-        assert (self.w13_sfq is not None) == (W13_FORMAT == "mxfp4")
-        assert (self.w2_sfq is not None) == (W2_FORMAT == "mxfp4")
+        assert (self.w13_sfq is not None) == (self.w13_format == "mxfp4")
+        assert (self.w2_sfq is not None) == (self.w2_format == "mxfp4")
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -192,3 +232,19 @@ class MegakernelExperts(mk.FusedMoEExpertsModular):
             w13_sfq=self.w13_sfq,
             out=output,
         )
+
+
+class MegakernelMxfp4Experts(MegakernelExperts):
+    """MXFP4 checkpoint experts (DeepSeek-V4: E2M1 codes with UE8M0 group-32 scales), repacked at
+    load into the kernel's packed MXFP4; activations still fp8 per-128-group."""
+
+    w13_format = "mxfp4"
+    w2_format = "mxfp4"
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None, activation_key: QuantKey | None
+    ) -> bool:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
+
+        return weight_key == kMxfp4Static and activation_key == kFp8Dynamic128Sym
