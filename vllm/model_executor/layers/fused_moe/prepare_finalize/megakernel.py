@@ -7,6 +7,8 @@ and the combine, so prepare only quantizes this rank's tokens (FP8, per-128-grou
 finalize only hands the reduced output back.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -18,12 +20,14 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
 def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
-    """The transport is keyed by the layer geometry: every MoE layer of a model shares one."""
+    """The transport is keyed by the layer geometry: every MoE layer of a model shares one.
+    MEGAKERNEL_COMBINE_FORMAT (fp8, default, or bf16) picks the combine payload precision."""
     return dict(
         hidden_size=moe.hidden_dim,
         top_k=moe.experts_per_token,
         num_local_experts=moe.num_local_experts,
         max_tokens_per_rank=moe.max_num_tokens,
+        combine_format=os.environ.get("MEGAKERNEL_COMBINE_FORMAT", "fp8"),
     )
 
 
