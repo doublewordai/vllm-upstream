@@ -12,6 +12,9 @@ kernel's packed MXFP4 (``megakernel.weights.pack_mxfp4``), halving the expert we
 import os
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
@@ -92,6 +95,8 @@ def _shared_kernel(transport, intermediate_size: int, w13_format: str, w2_format
         _kernels[key] = Megakernel(
             transport, intermediate_size, w2_format=w2_format, w13_format=w13_format, act_format=ACT_FORMAT
         )
+        # per-rank epochs / watchdog / error counters in the engine log when a layer stalls
+        _kernels[key].start_diagnostics(transport.my, logger.warning)
     return _kernels[key]
 
 
@@ -131,6 +136,8 @@ def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
 
 class MegakernelExperts(mk.FusedMoEExpertsModular):
     """fp8 block-quantized experts (optionally re-quantized to MXFP4 at load, see the module doc)."""
+    # A rank with no tokens still launches the collective kernel: every rank's layer epoch must advance together.
+    launch_when_empty = True
 
     w13_format = W13_FORMAT
     w2_format = W2_FORMAT
@@ -240,6 +247,8 @@ class MegakernelExperts(mk.FusedMoEExpertsModular):
 class MegakernelMxfp4Experts(MegakernelExperts):
     """MXFP4 checkpoint experts (DeepSeek-V4: E2M1 codes with UE8M0 group-32 scales), repacked at
     load into the kernel's packed MXFP4; activations still fp8 per-128-group."""
+    # A rank with no tokens still launches the collective kernel: every rank's layer epoch must advance together.
+    launch_when_empty = True
 
     w13_format = "mxfp4"
     w2_format = "mxfp4"
