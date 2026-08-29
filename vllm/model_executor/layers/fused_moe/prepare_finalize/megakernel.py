@@ -25,7 +25,7 @@ INT8_QUANT = os.environ.get("MEGAKERNEL_INT8_QUANT", "round")   # round (ours) |
 
 def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
     """The transport is keyed by the layer geometry: every MoE layer of a model shares one.
-    MEGAKERNEL_COMBINE_FORMAT (fp8, default, or bf16) picks the combine payload precision."""
+    MEGAKERNEL_COMBINE_FORMAT (fp8 default, int8, or bf16) picks the combine payload precision; int8 is fp8-speed at ~bf16 accuracy."""
     return dict(
         hidden_size=moe.hidden_dim,
         top_k=moe.experts_per_token,
