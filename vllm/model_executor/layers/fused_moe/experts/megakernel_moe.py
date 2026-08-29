@@ -146,12 +146,12 @@ def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
     if MegakernelMxfp4Experts.w13_format == "int8":
         w13, w13_scale = _repack_int8(il, ie); layer.megakernel_w13_sfq = None
     else:
-        w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie)
+        w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie, bf16=(ACT_FORMAT == "bf16"))   # bf16 dispatch: GEMM1 expands w13 to bf16
     c2, e2 = _unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8)
     if MegakernelMxfp4Experts.w2_format == "int8":
         w2, w2_scale = _repack_int8(c2, e2); layer.megakernel_w2_sfq = None
     else:
-        w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(c2, e2, bf16=(ACT_FORMAT == "int8+bf16"))   # GEMM2 expands w2 to bf16 exactly
+        w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(c2, e2, bf16=(ACT_FORMAT in ("int8+bf16", "bf16")))   # GEMM2 expands w2 to bf16
     return w13, w2, w13_scale, w2_scale
 
 
@@ -271,8 +271,8 @@ class MegakernelMxfp4Experts(MegakernelExperts):
     # A rank with no tokens still launches the collective kernel: every rank's layer epoch must advance together.
     launch_when_empty = True
 
-    w13_format = "int8" if WEIGHT_FORMAT == "int8" else "mxfp4"
-    w2_format = "int8" if (WEIGHT_FORMAT == "int8" and ACT_FORMAT != "int8+bf16") else "mxfp4"
+    w13_format = "int8" if (WEIGHT_FORMAT == "int8" and ACT_FORMAT != "bf16") else "mxfp4"   # bf16 activations need MXFP4 (expanded to bf16)
+    w2_format = "int8" if (WEIGHT_FORMAT == "int8" and ACT_FORMAT not in ("int8+bf16", "bf16")) else "mxfp4"
 
     @staticmethod
     def _supports_quant_scheme(

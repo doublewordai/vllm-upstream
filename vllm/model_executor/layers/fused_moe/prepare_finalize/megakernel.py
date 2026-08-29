@@ -19,7 +19,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
-ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 | int8+bf16 (int8 dispatch, bf16 SwiGLU output); int8 modes: MXFP4 weights only
+ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 | int8+bf16 (int8 dispatch, bf16 SwiGLU) | bf16 (bf16 dispatch, no activation quant); non-fp8: MXFP4 weights
 INT8_QUANT = os.environ.get("MEGAKERNEL_INT8_QUANT", "round")   # round (ours) | vllm (per_token_group_quant_int8, truncating)
 
 
@@ -32,6 +32,7 @@ def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
         num_local_experts=moe.num_local_experts,
         max_tokens_per_rank=moe.max_num_tokens,
         combine_format=os.environ.get("MEGAKERNEL_COMBINE_FORMAT", "fp8"),
+        dispatch_format=("bf16" if os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8") == "bf16" else "int8"),
     )
 
 
@@ -83,7 +84,11 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # The kernel dispatches per-128-group activations whatever the expert weight format: fp8 e4m3
         # by default, int8 with MEGAKERNEL_ACT_FORMAT=int8 (MXFP4 weights only); the quant config
         # only carries the weight scales.
-        if ACT_FORMAT != "fp8":
+        if ACT_FORMAT == "bf16":
+            # bf16 dispatch: the kernel takes bf16 activation rows directly (no per-128 quantisation).
+            a1q = a1.to(torch.bfloat16).contiguous()
+            a1q_scale = torch.ones((a1.shape[0], a1.shape[1] // 128), device=a1.device, dtype=torch.float32)
+        elif ACT_FORMAT != "fp8":
             # vLLM's per_token_group_quant_int8 truncates toward zero (measured gain 0.991 on real activations, a
             # -0.5 LSB bias that becomes a -1.8 % per-layer MoE output gain); quantise with round-to-nearest.
             # MEGAKERNEL_INT8_QUANT=vllm keeps the vLLM op (for reproducing its effects).
