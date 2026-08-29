@@ -14,6 +14,8 @@ import os
 import torch
 from vllm.logger import init_logger
 
+WEIGHT_FORMAT = os.environ.get("MEGAKERNEL_WEIGHT_FORMAT", "mxfp4")   # mxfp4 (packed, expanded on the fly) | int8 (unexpanded, 2x bytes)
+
 logger = init_logger(__name__)
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -119,6 +121,19 @@ def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor, bf16: bool = False)
     return bq, sfq, sfb
 
 
+def _repack_int8(codes: torch.Tensor, e8m0: torch.Tensor):
+    """MXFP4 experts [G, N, K] codes + [G, N, K/32] E8M0 -> unexpanded int8 weights [G, N, K] and block scales
+    [G, N/128, K/128] (pack_int8_from_mxfp4: per-block floors, the int8 expansion done once at load)."""
+    from megakernel.weights import pack_int8_from_mxfp4
+
+    G, N, K = codes.shape
+    w = torch.empty((G, N, K), dtype=torch.int8, device=codes.device)
+    sfb = torch.empty((G, N // 128, K // 128), dtype=torch.float32, device=codes.device)
+    for g in range(G):
+        w[g], sfb[g] = pack_int8_from_mxfp4(codes[g], e8m0[g], 3)
+    return w, sfb
+
+
 def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
     """MXFP4 checkpoint experts (vLLM layout: [G, N, K/2] packed nibbles, [G, N, K/32] E8M0 as
     uint8) -> the kernel's packed format, gate/up rows interleaved per 128-row block.  Returns
@@ -128,9 +143,15 @@ def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
     I = c13.shape[1] // 2
     il = torch.empty_like(c13); il[:, 0::2] = c13[:, :I]; il[:, 1::2] = c13[:, I:]
     ie = torch.empty_like(e13); ie[:, 0::2] = e13[:, :I]; ie[:, 1::2] = e13[:, I:]
-    w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie)
-    w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(_unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8),
-                                                            bf16=(ACT_FORMAT == "int8+bf16"))   # GEMM2 expands w2 to bf16 exactly
+    if MegakernelMxfp4Experts.w13_format == "int8":
+        w13, w13_scale = _repack_int8(il, ie); layer.megakernel_w13_sfq = None
+    else:
+        w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie)
+    c2, e2 = _unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8)
+    if MegakernelMxfp4Experts.w2_format == "int8":
+        w2, w2_scale = _repack_int8(c2, e2); layer.megakernel_w2_sfq = None
+    else:
+        w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(c2, e2, bf16=(ACT_FORMAT == "int8+bf16"))   # GEMM2 expands w2 to bf16 exactly
     return w13, w2, w13_scale, w2_scale
 
 
@@ -250,8 +271,8 @@ class MegakernelMxfp4Experts(MegakernelExperts):
     # A rank with no tokens still launches the collective kernel: every rank's layer epoch must advance together.
     launch_when_empty = True
 
-    w13_format = "mxfp4"
-    w2_format = "mxfp4"
+    w13_format = "int8" if WEIGHT_FORMAT == "int8" else "mxfp4"
+    w2_format = "int8" if (WEIGHT_FORMAT == "int8" and ACT_FORMAT != "int8+bf16") else "mxfp4"
 
     @staticmethod
     def _supports_quant_scheme(
