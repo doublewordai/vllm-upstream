@@ -58,7 +58,8 @@ def _pack_experts(w: torch.Tensor, scale: torch.Tensor):
     sfb = torch.empty_like(scale)
     for g in range(G):
         codes, e8m0 = quantize_mxfp4(_dequant_blocks(w[g], scale[g]))
-        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes, e8m0, int8=(ACT_FORMAT == "int8"))
+        assert ACT_FORMAT != "int8+bf16", "the bf16 intermediate needs MXFP4 checkpoints (no block scale to fold)"
+        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes, e8m0, int8=(ACT_FORMAT != "fp8"))
     return bq, sfq, sfb
 
 
@@ -99,7 +100,7 @@ def _unpack_nibbles(w: torch.Tensor) -> torch.Tensor:
     return torch.stack((w & 0x0F, w >> 4), dim=-1).reshape(*w.shape[:-1], w.shape[-1] * 2)
 
 
-def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor):
+def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor, bf16: bool = False):
     """[G, N, K] E2M1 codes + [G, N, K/32] E8M0 -> the kernel's packed MXFP4 (bq, sfq, sfb), no
     re-quantization: only the per-expert exponent clamp of megakernel.weights.pack_mxfp4."""
     from megakernel.weights import pack_mxfp4
@@ -109,7 +110,7 @@ def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor):
     sfq = torch.empty((G, K // 128, N, 4), dtype=torch.uint8, device=codes.device)
     sfb = torch.empty((G, N // 128, K // 128), dtype=torch.float32, device=codes.device)
     for g in range(G):
-        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes[g], e8m0[g], int8=(ACT_FORMAT == "int8"))
+        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes[g], e8m0[g], int8=(ACT_FORMAT != "fp8"), bf16=bf16)
     return bq, sfq, sfb
 
 
@@ -123,7 +124,8 @@ def convert_mxfp4_to_megakernel_format(layer, w13, w2, w13_scale, w2_scale):
     il = torch.empty_like(c13); il[:, 0::2] = c13[:, :I]; il[:, 1::2] = c13[:, I:]
     ie = torch.empty_like(e13); ie[:, 0::2] = e13[:, :I]; ie[:, 1::2] = e13[:, I:]
     w13, layer.megakernel_w13_sfq, w13_scale = _repack_experts(il, ie)
-    w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(_unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8))
+    w2, layer.megakernel_w2_sfq, w2_scale = _repack_experts(_unpack_nibbles(w2.data), w2_scale.data.view(torch.uint8),
+                                                            bf16=(ACT_FORMAT == "int8+bf16"))   # GEMM2 expands w2 to bf16 exactly
     return w13, w2, w13_scale, w2_scale
 
 

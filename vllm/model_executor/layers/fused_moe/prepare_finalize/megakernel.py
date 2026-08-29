@@ -19,7 +19,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
-ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 (int8: MXFP4 weights only)
+ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 | int8+bf16 (int8 dispatch, bf16 SwiGLU output); int8 modes: MXFP4 weights only
 
 
 def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
@@ -73,7 +73,7 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # The kernel dispatches per-128-group activations whatever the expert weight format: fp8 e4m3
         # by default, int8 with MEGAKERNEL_ACT_FORMAT=int8 (MXFP4 weights only); the quant config
         # only carries the weight scales.
-        if ACT_FORMAT == "int8":
+        if ACT_FORMAT != "fp8":
             from vllm.model_executor.layers.quantization.utils.int8_utils import (
                 per_token_group_quant_int8,
             )
