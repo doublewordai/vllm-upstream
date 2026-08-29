@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
+ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 (int8: MXFP4 weights only)
+
+
 def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
     """The transport is keyed by the layer geometry: every MoE layer of a model shares one.
     MEGAKERNEL_COMBINE_FORMAT (fp8, default, or bf16) picks the combine payload precision."""
@@ -67,16 +70,24 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             "the megakernel applies the router weights in the combine"
         )
         assert not defer_input_quant
-        # The kernel dispatches fp8 activations with per-128-group scales whatever the expert
-        # weight format (fp8 block or MXFP4); the quant config only carries the weight scales.
-        a1q, a1q_scale = moe_kernel_quantize_input(
-            a1,
-            None,
-            quant_dtype=torch.float8_e4m3fn,
-            per_act_token_quant=False,
-            block_shape=[128, 128],
-            is_scale_swizzled=False,
-        )
+        # The kernel dispatches per-128-group activations whatever the expert weight format: fp8 e4m3
+        # by default, int8 with MEGAKERNEL_ACT_FORMAT=int8 (MXFP4 weights only); the quant config
+        # only carries the weight scales.
+        if ACT_FORMAT == "int8":
+            from vllm.model_executor.layers.quantization.utils.int8_utils import (
+                per_token_group_quant_int8,
+            )
+
+            a1q, a1q_scale = per_token_group_quant_int8(a1, 128)
+        else:
+            a1q, a1q_scale = moe_kernel_quantize_input(
+                a1,
+                None,
+                quant_dtype=torch.float8_e4m3fn,
+                per_act_token_quant=False,
+                block_shape=[128, 128],
+                is_scale_swizzled=False,
+            )
         assert a1q_scale is not None
         return a1q, a1q_scale.contiguous(), None, topk_ids, topk_weights
 

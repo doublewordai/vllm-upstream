@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize.megakernel import (
+    ACT_FORMAT,
     megakernel_transport_kwargs,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -57,7 +58,7 @@ def _pack_experts(w: torch.Tensor, scale: torch.Tensor):
     sfb = torch.empty_like(scale)
     for g in range(G):
         codes, e8m0 = quantize_mxfp4(_dequant_blocks(w[g], scale[g]))
-        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes, e8m0)
+        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes, e8m0, int8=(ACT_FORMAT == "int8"))
     return bq, sfq, sfb
 
 
@@ -83,12 +84,12 @@ _kernels: dict = {}
 def _shared_kernel(transport, intermediate_size: int, w13_format: str, w2_format: str):
     """One kernel object (activation slabs, flags, cubin) per geometry, shared by every MoE layer
     of the process: the layers run one at a time and only the weights differ."""
-    key = (id(transport), intermediate_size, w13_format, w2_format)
+    key = (id(transport), intermediate_size, w13_format, w2_format, ACT_FORMAT)
     if key not in _kernels:
         from megakernel import Megakernel
 
         _kernels[key] = Megakernel(
-            transport, intermediate_size, w2_format=w2_format, w13_format=w13_format
+            transport, intermediate_size, w2_format=w2_format, w13_format=w13_format, act_format=ACT_FORMAT
         )
     return _kernels[key]
 
@@ -108,7 +109,7 @@ def _repack_experts(codes: torch.Tensor, e8m0: torch.Tensor):
     sfq = torch.empty((G, K // 128, N, 4), dtype=torch.uint8, device=codes.device)
     sfb = torch.empty((G, N // 128, K // 128), dtype=torch.float32, device=codes.device)
     for g in range(G):
-        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes[g], e8m0[g])
+        bq[g], sfq[g], sfb[g] = pack_mxfp4(codes[g], e8m0[g], int8=(ACT_FORMAT == "int8"))
     return bq, sfq, sfb
 
 
