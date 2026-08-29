@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
 ACT_FORMAT = os.environ.get("MEGAKERNEL_ACT_FORMAT", "fp8")   # fp8 | int8 | int8+bf16 (int8 dispatch, bf16 SwiGLU output); int8 modes: MXFP4 weights only
+INT8_QUANT = os.environ.get("MEGAKERNEL_INT8_QUANT", "round")   # round (ours) | vllm (per_token_group_quant_int8, truncating)
 
 
 def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
@@ -85,7 +86,12 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if ACT_FORMAT != "fp8":
             # vLLM's per_token_group_quant_int8 truncates toward zero (measured gain 0.991 on real activations, a
             # -0.5 LSB bias that becomes a -1.8 % per-layer MoE output gain); quantise with round-to-nearest.
-            a1q, a1q_scale = _quant_int8_groups(a1, 128)
+            # MEGAKERNEL_INT8_QUANT=vllm keeps the vLLM op (for reproducing its effects).
+            if INT8_QUANT == "vllm":
+                from vllm.model_executor.layers.quantization.utils.int8_utils import per_token_group_quant_int8
+                a1q, a1q_scale = per_token_group_quant_int8(a1, 128)
+            else:
+                a1q, a1q_scale = _quant_int8_groups(a1, 128)
         else:
             a1q, a1q_scale = moe_kernel_quantize_input(
                 a1,
