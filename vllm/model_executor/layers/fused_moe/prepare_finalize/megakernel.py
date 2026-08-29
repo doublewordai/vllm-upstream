@@ -34,6 +34,15 @@ def megakernel_transport_kwargs(moe: FusedMoEConfig) -> dict:
     )
 
 
+def _quant_int8_groups(x: torch.Tensor, group: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-(token, group) int8 with round-to-nearest: scale = amax / 127, q = round(x / scale)."""
+    T, H = x.shape
+    g = x.float().view(T, H // group, group)
+    scale = g.abs().amax(-1, keepdim=True).clamp(min=1e-10) / 127.0
+    q = torch.round(g / scale).clamp(-127, 127).to(torch.int8).view(T, H)
+    return q, scale.view(T, H // group)
+
+
 class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def __init__(self, transport) -> None:
         super().__init__()
@@ -74,11 +83,9 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # by default, int8 with MEGAKERNEL_ACT_FORMAT=int8 (MXFP4 weights only); the quant config
         # only carries the weight scales.
         if ACT_FORMAT != "fp8":
-            from vllm.model_executor.layers.quantization.utils.int8_utils import (
-                per_token_group_quant_int8,
-            )
-
-            a1q, a1q_scale = per_token_group_quant_int8(a1, 128)
+            # vLLM's per_token_group_quant_int8 truncates toward zero (measured gain 0.991 on real activations, a
+            # -0.5 LSB bias that becomes a -1.8 % per-layer MoE output gain); quantise with round-to-nearest.
+            a1q, a1q_scale = _quant_int8_groups(a1, 128)
         else:
             a1q, a1q_scale = moe_kernel_quantize_input(
                 a1,
