@@ -90,6 +90,8 @@ class MegakernelPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             if INT8_QUANT == "vllm":
                 from vllm.model_executor.layers.quantization.utils.int8_utils import per_token_group_quant_int8
                 a1q, a1q_scale = per_token_group_quant_int8(a1, 128)
+            elif hasattr(self.transport.C, "quant_int8_groups") and a1.dtype == torch.bfloat16 and a1.is_contiguous():
+                a1q, a1q_scale = self.transport.C.quant_int8_groups(a1)   # fused, one warp per (token, group)
             else:
                 a1q, a1q_scale = _quant_int8_groups(a1, 128)
         else:
