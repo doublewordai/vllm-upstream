@@ -7,7 +7,7 @@ extraction with a single :class:`StreamingParserEngine`.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -608,6 +608,44 @@ class ParserEngine(Parser):
                     return False
             return False
         return self._reasoning_ended
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        """Delta-scoped variant of :meth:`is_reasoning_end`.
+
+        Callers only ask this while the request is still inside its reasoning
+        span, so a transition can only occur within ``delta_ids``. Scanning
+        just that window costs O(len(delta_ids)) per decode step instead of
+        O(len(input_ids)), which otherwise makes structured-output decoding
+        quadratic in the generated length.
+
+        The window covers the whole delta, so a step that accepts many tokens
+        at once (speculative decoding) is still handled.
+
+        Engines that override :meth:`is_reasoning_end` (extra end conditions
+        such as an unpaired tool-call marker) keep their semantics: the delta
+        fast path only applies when the base token scan is the one in effect.
+        """
+        if type(self).is_reasoning_end is not ParserEngine.is_reasoning_end:
+            return self.is_reasoning_end(list(input_ids))
+        end_id = self._reasoning_end_token_id
+        if end_id is None:
+            return self._reasoning_ended
+        delta = tuple(delta_ids)
+        if not delta:
+            # No tokens this step: defer to the full scan so that the
+            # prompt-derived initial state is still honoured.
+            return self.is_reasoning_end(list(input_ids))
+        start_id = self._reasoning_start_token_id
+        # Scan backwards so the last marker in the window decides, matching
+        # is_reasoning_end's semantics.
+        for token in reversed(delta):
+            if token == end_id:
+                return True
+            if start_id is not None and token == start_id:
+                return False
+        return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         end_id = self._reasoning_end_token_id
