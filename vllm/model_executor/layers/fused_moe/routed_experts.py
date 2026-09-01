@@ -41,30 +41,6 @@ class FusedMoeWeightScaleSupported(Enum):
 
 
 @PluggableLayer.register("routed_experts")
-
-def _moe_fakeq(x: torch.Tensor) -> torch.Tensor:
-    """Debug: MOE_FAKEQ_FILE=<path> names a file whose content selects a fake quantization of the routed
-    experts' input (quantize + dequantize): int8-<group>, fp8-<group> (e4m3, scale amax/448) or none."""
-    import os
-    f = os.environ.get("MOE_FAKEQ_FILE")
-    if not f:
-        return x
-    try:
-        mode = open(f).read().strip()
-    except OSError:
-        return x
-    if not mode or mode == "none" or x.shape[0] == 0:
-        return x
-    kind, g = mode.split("-"); g = int(g)
-    xr = x.float().reshape(x.shape[0], -1, g)
-    if kind == "int8":
-        s = xr.abs().amax(-1, keepdim=True).clamp(min=1e-10) / 127.0
-        return (torch.round(xr / s).clamp(-127, 127) * s).reshape(x.shape).to(x.dtype)
-    if kind == "fp8":
-        s = xr.abs().amax(-1, keepdim=True).clamp(min=1e-10) / 448.0
-        return ((xr / s).clamp(-448, 448).to(torch.float8_e4m3fn).float() * s).reshape(x.shape).to(x.dtype)
-    return x
-
 class RoutedExperts(PluggableLayer):
     """
     Container for routed expert weights and execution logic.
@@ -1245,7 +1221,6 @@ class RoutedExperts(PluggableLayer):
         assert not self.quant_method.is_monolithic
 
         # Modular kernels use pre-computed routing
-        x = _moe_fakeq(x)
         out = self.quant_method.apply(
             layer=self,
             x=x,
