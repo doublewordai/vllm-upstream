@@ -128,6 +128,7 @@ class Mxfp4MoeBackend(Enum):
     EMULATION = "EMULATION"
     # Humming
     HUMMING = "HUMMING"
+    MEGAKERNEL = "MEGAKERNEL"
 
 
 # Backends that share the same TRTLLM weight format
@@ -190,6 +191,12 @@ def backend_to_kernel_cls(
 
         return [UnfusedOAITritonExperts]
 
+    elif backend == Mxfp4MoeBackend.MEGAKERNEL:
+        from vllm.model_executor.layers.fused_moe.experts.megakernel_moe import (
+            MegakernelMxfp4Experts,
+        )
+
+        return [MegakernelMxfp4Experts]
     elif backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
             BatchedHummingGroupedExperts,
@@ -353,7 +360,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
 
 def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
-    if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+    if backend in (Mxfp4MoeBackend.DEEPGEMM_MXFP4, Mxfp4MoeBackend.MEGAKERNEL):
         return kFp8Dynamic128Sym
     if backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
@@ -463,6 +470,12 @@ def select_mxfp4_moe_backend(
         if config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
+
+    # The megakernel is selected by the all2all backend: it owns the dispatch and combine.
+    if config.moe_parallel_config.use_megakernel_kernels:
+        return _return_or_raise(
+            Mxfp4MoeBackend.MEGAKERNEL, config, kMxfp4Static, kFp8Dynamic128Sym, activation_format
+        )
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":
@@ -575,6 +588,12 @@ def select_deepseek_v4_mxfp4_moe_backend(
 
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
+    # The megakernel is selected by the all2all backend: it owns the dispatch and combine.
+    if config.moe_parallel_config.use_megakernel_kernels:
+        return _return_or_raise(
+            Mxfp4MoeBackend.MEGAKERNEL, config, kMxfp4Static, kFp8Dynamic128Sym, activation_format
+        )
+
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backends = map_mxfp4_backend(runner_backend)
@@ -1305,6 +1324,17 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    if mxfp4_backend == Mxfp4MoeBackend.MEGAKERNEL:
+        from vllm.model_executor.layers.fused_moe.experts.megakernel_moe import (
+            convert_mxfp4_to_megakernel_format,
+        )
+
+        w13_weight, w2_weight, w13_weight_scale, w2_weight_scale = (
+            convert_mxfp4_to_megakernel_format(
+                layer, w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
+            )
+        )
+        return w13_weight, w2_weight, w13_weight_scale, w2_weight_scale, w13_bias, w2_bias
     if mxfp4_backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,
@@ -1711,6 +1741,18 @@ def make_mxfp4_moe_quant_config(
     layer: "RoutedExperts | None" = None,
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
+    if mxfp4_backend == Mxfp4MoeBackend.MEGAKERNEL:
+        from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
+
+        cfg = fp8_w8a8_moe_quant_config(
+            w1_scale=w1_scale, w2_scale=w2_scale, a1_scale=None, a2_scale=None, block_shape=[128, 128]
+        )
+        object.__setattr__(
+            cfg,
+            "megakernel_sfq",
+            (getattr(layer, "megakernel_w13_sfq", None), getattr(layer, "megakernel_w2_sfq", None)),
+        )
+        return cfg
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             GroupShape,

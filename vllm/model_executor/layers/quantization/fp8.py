@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -755,6 +756,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gemm1_beta=getattr(layer, "swiglu_beta", None),
             layer=layer,
         )
+
+        if quant_config is not None and self.fp8_backend == Fp8MoeBackend.MEGAKERNEL:
+            object.__setattr__(
+                quant_config,
+                "megakernel_sfq",
+                (
+                    getattr(layer, "megakernel_w13_sfq", None),
+                    getattr(layer, "megakernel_w2_sfq", None),
+                ),
+            )
 
         # Inject biases into the quant config if the model has them
         # (e.g. GPT-OSS biased MoE)

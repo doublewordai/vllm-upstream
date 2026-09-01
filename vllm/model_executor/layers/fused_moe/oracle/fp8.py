@@ -47,6 +47,7 @@ class Fp8MoeBackend(Enum):
     BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
+    MEGAKERNEL = "MEGAKERNEL"
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
     AITER = "AITER"
@@ -86,6 +87,7 @@ def _get_priority_backends(
         Fp8MoeBackend.TRITON,
         Fp8MoeBackend.MARLIN,
         Fp8MoeBackend.HUMMING,
+        Fp8MoeBackend.MEGAKERNEL,
         Fp8MoeBackend.BATCHED_DEEPGEMM,
         Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
         Fp8MoeBackend.BATCHED_TRITON,
@@ -164,6 +166,13 @@ def backend_to_kernel_cls(
         )
 
         return [BatchedDeepGemmExperts]
+
+    elif backend == Fp8MoeBackend.MEGAKERNEL:
+        from vllm.model_executor.layers.fused_moe.experts.megakernel_moe import (
+            MegakernelExperts,
+        )
+
+        return [MegakernelExperts]
 
     elif backend == Fp8MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
@@ -327,6 +336,12 @@ def select_fp8_moe_backend(
         raise ValueError(_make_log_unsupported(backend, reason))
 
     # Handle explicit moe_backend from user.
+    # The megakernel is selected by the all2all backend: it owns the dispatch and combine.
+    if config.moe_parallel_config.use_megakernel_kernels:
+        return _return_or_raise(
+            Fp8MoeBackend.MEGAKERNEL, config, weight_key, activation_key, activation_format
+        )
+
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_fp8_backend(runner_backend)
@@ -491,6 +506,15 @@ def convert_to_fp8_moe_kernel_format(
         )
         w13.is_shuffled = True
         w2.is_shuffled = True
+    elif fp8_backend == Fp8MoeBackend.MEGAKERNEL:
+        from vllm.model_executor.layers.fused_moe.experts.megakernel_moe import (
+            convert_to_megakernel_format,
+        )
+
+        assert block_quant
+        w13, w2, w13_scale, w2_scale = convert_to_megakernel_format(
+            layer, w13, w2, w13_scale, w2_scale
+        )
     elif fp8_backend == Fp8MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,

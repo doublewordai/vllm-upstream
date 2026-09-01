@@ -10,7 +10,7 @@ any changes to the serving layer itself.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -64,6 +64,14 @@ class ParserEngineReasoningAdapter(ReasoningParser):
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        # Forward to the engine's delta-scoped check. Without this override
+        # the ReasoningParser base falls back to is_reasoning_end(input_ids),
+        # which copies and rescans the whole sequence on every decode step.
+        return self._parser_engine.is_reasoning_end_streaming(input_ids, delta_ids)
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)

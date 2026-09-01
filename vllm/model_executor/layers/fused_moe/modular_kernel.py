@@ -1302,7 +1302,7 @@ class FusedMoEKernelModularImpl:
         # kernels. CUDAGraph compatible all2all kernels like the DeepEP
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
-        if M_full == 0:
+        if M_full == 0 and not getattr(self.fused_experts, "launch_when_empty", False):
             return torch.empty_like(a1q, dtype=in_dtype)
 
         workspace13, workspace2, fused_out = self._allocate_buffers(

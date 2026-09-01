@@ -312,6 +312,14 @@ def maybe_make_prepare_finalize(
             dispatch_scale_bytes_per_token=dispatch_scale_bytes_per_token,
         )
 
+    elif moe.use_megakernel_kernels:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.megakernel import (
+            MegakernelPrepareAndFinalize,
+            megakernel_transport_kwargs,
+        )
+
+        transport = all2all_manager.get_handle(megakernel_transport_kwargs(moe))
+        prepare_finalize = MegakernelPrepareAndFinalize(transport)
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
         prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
             use_monolithic=use_monolithic,
