@@ -1028,7 +1028,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and has_deep_gemm():
                 metadata = get_paged_mqa_logits_metadata(
-                    seq_lens,
+                    torch.clamp(seq_lens, min=1),  # dsv4-max clamp: all-zero ctx lens OOB in DeepGEMM sm90 metadata
                     self.kv_cache_spec.storage_block_size,
                     self.num_sms,
                     indices=decode_indices,
